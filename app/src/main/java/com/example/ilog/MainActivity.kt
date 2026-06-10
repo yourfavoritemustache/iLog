@@ -3,8 +3,11 @@ package com.example.ilog
 import android.content.ComponentName
 import android.content.Context
 import android.content.Intent
+import android.net.Uri
+import android.os.Build
 import android.os.Bundle
-import android.provider.Settings
+import android.os.PowerManager
+import android.provider.Settings as AndroidSettings
 import android.text.TextUtils
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
@@ -14,10 +17,13 @@ import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
+import androidx.compose.foundation.layout.consumeWindowInsets
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.imePadding
 import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
@@ -25,6 +31,7 @@ import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Add
+import androidx.compose.material.icons.filled.CheckCircle
 import androidx.compose.material.icons.filled.Delete
 import androidx.compose.material.icons.filled.ArrowDropDown
 import androidx.compose.material.icons.filled.Edit
@@ -33,8 +40,10 @@ import androidx.compose.material.icons.filled.KeyboardArrowDown
 import androidx.compose.material.icons.filled.KeyboardArrowUp
 import androidx.compose.material.icons.filled.MoreVert
 import androidx.compose.material.icons.filled.Settings
+import androidx.compose.material.icons.filled.Warning
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
+import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.Card
 import androidx.compose.material3.CardDefaults
 import androidx.compose.material3.Checkbox
@@ -44,9 +53,11 @@ import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.RadioButton
 import androidx.compose.material3.Scaffold
+import androidx.compose.material3.ScrollableTabRow
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Tab
 import androidx.compose.material3.TabRow
@@ -65,6 +76,7 @@ import androidx.compose.runtime.setValue
 import androidx.compose.runtime.toMutableStateList
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalLifecycleOwner
 import androidx.compose.ui.text.input.PasswordVisualTransformation
@@ -81,6 +93,7 @@ import kotlinx.coroutines.withContext
 import kotlinx.serialization.Serializable
 import kotlinx.serialization.encodeToString
 import kotlinx.serialization.json.Json
+import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.buildJsonObject
 import kotlinx.serialization.json.put
 import kotlinx.serialization.json.jsonObject
@@ -107,6 +120,16 @@ data class BodyMapping(
     val valueTemplate: String
 )
 
+@Serializable
+data class BackupPayload(
+    val selectedApps: List<String>,
+    val rules: Map<String, String>,
+    val mappings: Map<String, String>,
+    val supabaseUrl: String,
+    val supabaseTable: String,
+    val supabaseKey: String
+)
+
 class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -122,14 +145,17 @@ class MainActivity : ComponentActivity() {
 @Composable
 fun MainContainer() {
     var selectedTabIndex by remember { mutableStateOf(0) }
-    val tabs = listOf("Home", "Database", "App Config", "Test Send", "Debug Logs")
+    val tabs = listOf("Home", "Database", "App Config", "Test Send", "History", "Debug Logs")
 
     Scaffold(
         modifier = Modifier.fillMaxSize(),
         topBar = {
             Column {
                 Spacer(modifier = Modifier.height(32.dp))
-                TabRow(selectedTabIndex = selectedTabIndex) {
+                ScrollableTabRow(
+                    selectedTabIndex = selectedTabIndex,
+                    edgePadding = 16.dp
+                ) {
                     tabs.forEachIndexed { index, title ->
                         Tab(
                             selected = selectedTabIndex == index,
@@ -141,13 +167,19 @@ fun MainContainer() {
             }
         }
     ) { innerPadding ->
-        Box(modifier = Modifier.padding(innerPadding)) {
+        Box(
+            modifier = Modifier
+                .padding(innerPadding)
+                .consumeWindowInsets(innerPadding)
+                .imePadding()
+        ) {
             when (selectedTabIndex) {
                 0 -> HomeScreen()
                 1 -> DatabaseConfigScreen()
                 2 -> AppConfigScreen()
                 3 -> TestSendScreen()
-                4 -> DebugLogsScreen()
+                4 -> NotificationHistoryScreen()
+                5 -> DebugLogsScreen()
             }
         }
     }
@@ -155,44 +187,126 @@ fun MainContainer() {
 
 @Composable
 fun HomeScreen() {
+    val context = LocalContext.current
+    val lifecycleOwner = LocalLifecycleOwner.current
+    
+    var isPermissionEnabled by remember { mutableStateOf(isNotificationServiceEnabled(context)) }
+    var isBatteryOptimized by remember { mutableStateOf(isBatteryOptimized(context)) }
+    var isHibernationDisabled by remember { mutableStateOf(isHibernationDisabled(context)) }
+    var showPermissionDialog by remember { mutableStateOf(false) }
+
+    val allSystemsGo = isPermissionEnabled && !isBatteryOptimized
+
+    DisposableEffect(lifecycleOwner) {
+        val observer = LifecycleEventObserver { _, event ->
+            if (event == Lifecycle.Event.ON_RESUME) {
+                isPermissionEnabled = isNotificationServiceEnabled(context)
+                isBatteryOptimized = isBatteryOptimized(context)
+                isHibernationDisabled = isHibernationDisabled(context)
+                if (!isPermissionEnabled) {
+                    showPermissionDialog = true
+                }
+            }
+        }
+        lifecycleOwner.lifecycle.addObserver(observer)
+        onDispose {
+            lifecycleOwner.lifecycle.removeObserver(observer)
+        }
+    }
+
     Column(
         modifier = Modifier
             .fillMaxSize()
-            .padding(16.dp),
-        horizontalAlignment = Alignment.CenterHorizontally,
-        verticalArrangement = Arrangement.Center
+            .padding(16.dp)
+            .verticalScroll(rememberScrollState()),
+        horizontalAlignment = Alignment.CenterHorizontally
     ) {
-        Text(
-            text = "Welcome to iLog",
-            style = MaterialTheme.typography.headlineLarge
-        )
-        Spacer(modifier = Modifier.height(16.dp))
-        Text(
-            text = "iLog is your personal notification assistant. It captures important information from your notifications, extracts key data like amounts and merchants, and syncs everything directly to your Supabase database.",
-            textAlign = androidx.compose.ui.text.style.TextAlign.Center,
-            style = MaterialTheme.typography.bodyLarge
-        )
+        Spacer(modifier = Modifier.height(8.dp))
         
-        Spacer(modifier = Modifier.height(32.dp))
-        
-        val context = LocalContext.current
-        val lifecycleOwner = LocalLifecycleOwner.current
-        var isPermissionEnabled by remember { mutableStateOf(isNotificationServiceEnabled(context)) }
-        var showPermissionDialog by remember { mutableStateOf(false) }
-
-        DisposableEffect(lifecycleOwner) {
-            val observer = LifecycleEventObserver { _, event ->
-                if (event == Lifecycle.Event.ON_RESUME) {
-                    isPermissionEnabled = isNotificationServiceEnabled(context)
-                    if (!isPermissionEnabled) {
-                        showPermissionDialog = true
-                    }
+        // Status Summary Card
+        Card(
+            modifier = Modifier.fillMaxWidth(),
+            colors = CardDefaults.cardColors(
+                containerColor = if (allSystemsGo) Color(0xFFC8E6C9) else Color(0xFFFFCDD2)
+            )
+        ) {
+            Row(
+                modifier = Modifier.padding(20.dp),
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                Icon(
+                    imageVector = if (allSystemsGo) Icons.Default.CheckCircle else Icons.Default.Warning,
+                    contentDescription = null,
+                    tint = if (allSystemsGo) Color(0xFF2E7D32) else Color(0xFFC62828),
+                    modifier = Modifier.size(40.dp)
+                )
+                Spacer(modifier = Modifier.width(16.dp))
+                Column {
+                    Text(
+                        text = if (allSystemsGo) "All Systems Ready" else "Action Required",
+                        style = MaterialTheme.typography.headlineSmall,
+                        color = if (allSystemsGo) Color(0xFF1B5E20) else Color(0xFFB71C1C)
+                    )
+                    Text(
+                        text = if (allSystemsGo) 
+                            "iLog is correctly configured and tracking." 
+                        else "Check the settings below to fix issues.",
+                        style = MaterialTheme.typography.bodyMedium,
+                        color = if (allSystemsGo) Color(0xFF2E7D32) else Color(0xFFC62828)
+                    )
                 }
             }
-            lifecycleOwner.lifecycle.addObserver(observer)
-            onDispose {
-                lifecycleOwner.lifecycle.removeObserver(observer)
+        }
+
+        Spacer(modifier = Modifier.height(24.dp))
+        
+        Text(
+            text = "Required Configuration",
+            style = MaterialTheme.typography.titleMedium,
+            modifier = Modifier.fillMaxWidth().padding(bottom = 8.dp)
+        )
+        
+        SettingsItem(
+            title = "Notification Access",
+            description = "Allows iLog to read notifications from Revolut and others.",
+            isCompleted = isPermissionEnabled,
+            onClick = {
+                context.startActivity(Intent("android.settings.ACTION_NOTIFICATION_LISTENER_SETTINGS"))
             }
+        )
+        
+        Spacer(modifier = Modifier.height(16.dp))
+        
+        Text(
+            text = "Reliability Settings",
+            style = MaterialTheme.typography.titleMedium,
+            modifier = Modifier.fillMaxWidth().padding(bottom = 8.dp)
+        )
+        
+        SettingsItem(
+            title = "Battery: Unrestricted",
+            description = "Prevents Android from stopping iLog while the screen is locked.",
+            isCompleted = !isBatteryOptimized,
+            onClick = {
+                val intent = Intent(AndroidSettings.ACTION_APPLICATION_DETAILS_SETTINGS).apply {
+                    data = Uri.fromParts("package", context.packageName, null)
+                }
+                context.startActivity(intent)
+            }
+        )
+
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+            SettingsItem(
+                title = "Permission Hibernation",
+                description = "Keeps permissions active if you don't open iLog for a while.",
+                isCompleted = isHibernationDisabled,
+                onClick = {
+                    val intent = Intent(AndroidSettings.ACTION_APPLICATION_DETAILS_SETTINGS).apply {
+                        data = Uri.fromParts("package", context.packageName, null)
+                    }
+                    context.startActivity(intent)
+                }
+            )
         }
 
         if (showPermissionDialog && !isPermissionEnabled) {
@@ -215,15 +329,262 @@ fun HomeScreen() {
                 }
             )
         }
-        
-        NotificationStatusHeader(isPermissionEnabled)
+    }
+}
+
+@Composable
+fun SettingsItem(
+    title: String,
+    description: String,
+    isCompleted: Boolean,
+    onClick: () -> Unit
+) {
+    val backgroundColor = if (isCompleted) Color(0xFFE8F5E9) else Color(0xFFFFF3E0) // Greenish vs Orangi-Red
+    val contentColor = if (isCompleted) Color(0xFF2E7D32) else Color(0xFFE65100)
+    val borderColor = if (isCompleted) Color(0xFFA5D6A7) else Color(0xFFFFCC80)
+
+    Card(
+        modifier = Modifier
+            .fillMaxWidth()
+            .padding(vertical = 4.dp),
+        onClick = onClick,
+        colors = CardDefaults.cardColors(containerColor = backgroundColor),
+        border = androidx.compose.foundation.BorderStroke(1.dp, borderColor)
+    ) {
+        Row(
+            modifier = Modifier.padding(16.dp),
+            verticalAlignment = Alignment.CenterVertically
+        ) {
+            Icon(
+                imageVector = if (isCompleted) Icons.Default.CheckCircle else Icons.Default.Warning,
+                contentDescription = null,
+                tint = contentColor
+            )
+            Spacer(modifier = Modifier.width(16.dp))
+            Column(modifier = Modifier.weight(1f)) {
+                Text(
+                    text = title, 
+                    style = MaterialTheme.typography.titleSmall,
+                    color = contentColor
+                )
+                Text(
+                    text = description, 
+                    style = MaterialTheme.typography.bodySmall, 
+                    color = contentColor.copy(alpha = 0.8f)
+                )
+            }
+            if (!isCompleted) {
+                Text(
+                    text = "FIX",
+                    style = MaterialTheme.typography.labelLarge,
+                    color = Color(0xFFC62828),
+                    modifier = Modifier.padding(start = 8.dp)
+                )
+            }
+        }
+    }
+}
+
+fun isBatteryOptimized(context: Context): Boolean {
+    val powerManager = context.getSystemService(Context.POWER_SERVICE) as PowerManager
+    // isIgnoringBatteryOptimizations returns true if the app is UNRESTRICTED (whitelisted)
+    return !powerManager.isIgnoringBatteryOptimizations(context.packageName)
+}
+
+fun isHibernationDisabled(context: Context): Boolean {
+    return if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+        context.packageManager.isAutoRevokeWhitelisted
+    } else {
+        true
     }
 }
 
 @Composable
 fun DatabaseConfigScreen() {
-    Column(modifier = Modifier.fillMaxSize()) {
+    Column(modifier = Modifier.fillMaxSize().verticalScroll(rememberScrollState())) {
         SupabaseConfigSection()
+        HorizontalDivider(modifier = Modifier.padding(horizontal = 16.dp))
+        BackupRestoreSection()
+    }
+}
+
+@Composable
+fun BackupRestoreSection() {
+    val context = LocalContext.current
+    val scope = rememberCoroutineScope()
+    val encryptedPrefs = remember { SecurityUtils.getEncryptedPrefs(context) }
+    
+    var backupKey by remember { mutableStateOf("") }
+    var statusMessage by remember { mutableStateOf("") }
+    var isLoading by remember { mutableStateOf(false) }
+
+    Card(
+        modifier = Modifier
+            .padding(16.dp)
+            .fillMaxWidth(),
+        elevation = CardDefaults.cardElevation(defaultElevation = 2.dp)
+    ) {
+        Column(modifier = Modifier.padding(16.dp)) {
+            Text(text = "Online Backup & Restore", style = MaterialTheme.typography.titleMedium)
+            Text(
+                text = "Securely save your rules and mappings to your Supabase database.",
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.outline
+            )
+            Spacer(modifier = Modifier.height(16.dp))
+            
+            OutlinedTextField(
+                value = backupKey,
+                onValueChange = { backupKey = it },
+                label = { Text("Unique Backup Key") },
+                modifier = Modifier.fillMaxWidth(),
+                placeholder = { Text("e.g. my-secret-backup-123") }
+            )
+            
+            Spacer(modifier = Modifier.height(16.dp))
+            
+            Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                Button(
+                    onClick = {
+                        if (backupKey.isBlank()) {
+                            statusMessage = "Error: Please enter a backup key"
+                            return@Button
+                        }
+                        isLoading = true
+                        scope.launch(Dispatchers.IO) {
+                            val result = performBackup(context, backupKey)
+                            withContext(Dispatchers.Main) {
+                                statusMessage = result
+                                isLoading = false
+                            }
+                        }
+                    },
+                    modifier = Modifier.weight(1f),
+                    enabled = !isLoading
+                ) {
+                    Text("Backup")
+                }
+                
+                OutlinedButton(
+                    onClick = {
+                        if (backupKey.isBlank()) {
+                            statusMessage = "Error: Please enter a backup key"
+                            return@OutlinedButton
+                        }
+                        isLoading = true
+                        scope.launch(Dispatchers.IO) {
+                            val result = performRestore(context, backupKey)
+                            withContext(Dispatchers.Main) {
+                                statusMessage = result
+                                isLoading = false
+                            }
+                        }
+                    },
+                    modifier = Modifier.weight(1f),
+                    enabled = !isLoading
+                ) {
+                    Text("Restore")
+                }
+            }
+            
+            if (statusMessage.isNotEmpty()) {
+                Spacer(modifier = Modifier.height(16.dp))
+                Text(
+                    text = statusMessage,
+                    style = MaterialTheme.typography.bodySmall,
+                    color = if (statusMessage.startsWith("Error")) MaterialTheme.colorScheme.error else MaterialTheme.colorScheme.primary
+                )
+            }
+        }
+    }
+}
+
+private suspend fun performBackup(context: Context, key: String): String {
+    val encryptedPrefs = SecurityUtils.getEncryptedPrefs(context)
+    val sbUrl = encryptedPrefs.getString("supabase_url", "") ?: ""
+    val sbKey = encryptedPrefs.getString("supabase_key", "") ?: ""
+    val sbTable = encryptedPrefs.getString("supabase_table", "") ?: ""
+
+    if (sbUrl.isBlank() || sbKey.isBlank()) return "Error: Configure Supabase first"
+
+    // Collect all settings
+    val iLogPrefs = context.getSharedPreferences("iLogPrefs", Context.MODE_PRIVATE)
+    val rulesPrefs = context.getSharedPreferences("iLogRules", Context.MODE_PRIVATE)
+    val mappingsPrefs = context.getSharedPreferences("iLogMappings", Context.MODE_PRIVATE)
+
+    val selectedApps = iLogPrefs.getStringSet("selected_apps", emptySet())?.toList() ?: emptyList()
+    
+    val rulesMap = mutableMapOf<String, String>()
+    rulesPrefs.all.forEach { (k, v) -> if (v is String) rulesMap[k] = v }
+    
+    val mappingsMap = mutableMapOf<String, String>()
+    mappingsPrefs.all.forEach { (k, v) -> if (v is String) mappingsMap[k] = v }
+
+    val payload = BackupPayload(
+        selectedApps = selectedApps,
+        rules = rulesMap,
+        mappings = mappingsMap,
+        supabaseUrl = sbUrl,
+        supabaseTable = sbTable,
+        supabaseKey = sbKey
+    )
+
+    return try {
+        val client = createSupabaseClient(sbUrl, sbKey) { install(Postgrest) }
+        val jsonPayload = Json.encodeToString(payload)
+        
+        // Use a dedicated table 'user_backups'
+        // Upsert by backup_key
+        val data = buildJsonObject {
+            put("backup_key", key)
+            put("data", Json.parseToJsonElement(jsonPayload))
+        }
+        
+        client.from("user_backups").upsert(data)
+        "Success: Backup saved to 'user_backups' table"
+    } catch (e: Exception) {
+        "Error: ${e.message}. (Make sure 'user_backups' table exists with 'backup_key' and 'data' columns)"
+    }
+}
+
+private suspend fun performRestore(context: Context, key: String): String {
+    val encryptedPrefs = SecurityUtils.getEncryptedPrefs(context)
+    val sbUrl = encryptedPrefs.getString("supabase_url", "") ?: ""
+    val sbKey = encryptedPrefs.getString("supabase_key", "") ?: ""
+
+    if (sbUrl.isBlank() || sbKey.isBlank()) return "Error: Configure Supabase first to connect to backup"
+
+    return try {
+        val client = createSupabaseClient(sbUrl, sbKey) { install(Postgrest) }
+        val response = client.from("user_backups")
+            .select { filter { eq("backup_key", key) } }
+            .decodeSingle<JsonObject>()
+            
+        val dataJson = response["data"]?.jsonObject.toString()
+        val payload = Json.decodeFromString<BackupPayload>(dataJson)
+
+        // Apply settings
+        val iLogPrefs = context.getSharedPreferences("iLogPrefs", Context.MODE_PRIVATE)
+        val rulesPrefs = context.getSharedPreferences("iLogRules", Context.MODE_PRIVATE)
+        val mappingsPrefs = context.getSharedPreferences("iLogMappings", Context.MODE_PRIVATE)
+
+        iLogPrefs.edit().putStringSet("selected_apps", payload.selectedApps.toSet()).apply()
+        
+        rulesPrefs.edit().clear().apply()
+        payload.rules.forEach { (k, v) -> rulesPrefs.edit().putString(k, v).apply() }
+        
+        mappingsPrefs.edit().clear().apply()
+        payload.mappings.forEach { (k, v) -> mappingsPrefs.edit().putString(k, v).apply() }
+
+        encryptedPrefs.edit()
+            .putString("supabase_url", payload.supabaseUrl)
+            .putString("supabase_table", payload.supabaseTable)
+            .putString("supabase_key", payload.supabaseKey)
+            .apply()
+
+        "Success: Settings restored! Please restart the app for all changes to take effect."
+    } catch (e: Exception) {
+        "Error: ${e.message}. Key not found or restore failed."
     }
 }
 
@@ -591,11 +952,28 @@ private suspend fun performTestSend(
                     resolutionContext.forEach { (name, value) ->
                         resolvedValue = resolvedValue.replace("{$name}", value, ignoreCase = true)
                     }
-                    val numericValue = resolvedValue.toDoubleOrNull()
-                    if (numericValue != null && !mapping.valueTemplate.contains("{")) {
-                        put(mapping.key, numericValue)
+
+                    // If placeholder still exists, variable extraction failed
+                    if (resolvedValue.contains("{") && resolvedValue.contains("}")) {
+                        put(mapping.key, null as String?)
+                        return@forEach
+                    }
+
+                    // Identify if this was a direct numeric variable like {amount}
+                    val isDirectVar = mapping.valueTemplate.startsWith("{") && mapping.valueTemplate.endsWith("}")
+                    val varName = if (isDirectVar) mapping.valueTemplate.substring(1, mapping.valueTemplate.length - 1).lowercase() else ""
+                    val isNumericVar = varName == "amount" || varName.contains("price") || varName.contains("total")
+
+                    if (isDirectVar && isNumericVar) {
+                        val parsed = parseAmount(resolvedValue)
+                        if (parsed != null) put(mapping.key, parsed) else put(mapping.key, null as Double?)
                     } else {
-                        put(mapping.key, resolvedValue)
+                        val numericValue = resolvedValue.toDoubleOrNull()
+                        if (numericValue != null && !mapping.valueTemplate.contains("{")) {
+                            put(mapping.key, numericValue)
+                        } else {
+                            put(mapping.key, resolvedValue)
+                        }
                     }
                 }
             }
@@ -609,6 +987,276 @@ private suspend fun performTestSend(
     } catch (e: Exception) {
         AppLog.e(context, "TestSend", "Failed to send test", e)
         "Error: ${e.message}"
+    }
+}
+
+@Composable
+fun NotificationHistoryScreen() {
+    val context = LocalContext.current
+    val sharedPrefs = remember { context.getSharedPreferences("iLogPrefs", Context.MODE_PRIVATE) }
+    val historyPrefs = remember { context.getSharedPreferences("iLogHistory", Context.MODE_PRIVATE) }
+    val scope = rememberCoroutineScope()
+
+    var selectedPackageNames by remember {
+        mutableStateOf(sharedPrefs.getStringSet("selected_apps", emptySet()) ?: emptySet())
+    }
+
+    val pm = context.packageManager
+    val selectedApps = remember(selectedPackageNames) {
+        selectedPackageNames.map { pkg ->
+            try {
+                val ai = pm.getApplicationInfo(pkg, 0)
+                AppInfo(pm.getApplicationLabel(ai).toString(), pkg)
+            } catch (e: Exception) {
+                AppInfo(pkg, pkg)
+            }
+        }.sortedBy { it.name }
+    }
+
+    var selectedApp by remember { mutableStateOf<AppInfo?>(selectedApps.firstOrNull()) }
+    var historyList by remember { mutableStateOf(listOf<NotificationEntry>()) }
+    var activeNotifications by remember { mutableStateOf(listOf<NotificationEntry>()) }
+
+    fun refreshHistory() {
+        val app = selectedApp
+        if (app != null) {
+            val json = historyPrefs.getString(app.packageName, "[]") ?: "[]"
+            historyList = try {
+                Json.decodeFromString<List<NotificationEntry>>(json)
+            } catch (e: Exception) {
+                emptyList()
+            }
+        } else {
+            // Load all history
+            val allHistory = mutableListOf<NotificationEntry>()
+            selectedPackageNames.forEach { pkg ->
+                val json = historyPrefs.getString(pkg, "[]") ?: "[]"
+                try {
+                    allHistory.addAll(Json.decodeFromString<List<NotificationEntry>>(json))
+                } catch (e: Exception) {}
+            }
+            historyList = allHistory.sortedByDescending { it.postTime }
+        }
+    }
+
+    fun refreshActive() {
+        val active = NotificationService.getActiveNotifications()
+        activeNotifications = active?.filter { sbn ->
+            selectedApp == null || sbn.packageName == selectedApp?.packageName
+        }?.map { sbn ->
+            val extras = sbn.notification.extras
+            NotificationEntry(
+                title = extras.getString("android.title") ?: "No Title",
+                text = extras.getCharSequence("android.text")?.toString() ?: "No Text",
+                postTime = sbn.postTime,
+                packageName = sbn.packageName
+            )
+        }?.sortedByDescending { it.postTime } ?: emptyList()
+    }
+
+    LaunchedEffect(selectedApp) {
+        refreshHistory()
+        refreshActive()
+    }
+
+    Column(modifier = Modifier.fillMaxSize().padding(16.dp)) {
+        Text("Notification History", style = MaterialTheme.typography.headlineSmall)
+        Text(
+            "View recently captured notifications or current active ones from the tray.",
+            style = MaterialTheme.typography.bodySmall,
+            modifier = Modifier.padding(bottom = 16.dp)
+        )
+
+        if (selectedApps.isEmpty()) {
+            Box(modifier = Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
+                Text("No apps configured. Go to 'App Config' first.")
+            }
+        } else {
+            var expanded by remember { mutableStateOf(false) }
+            Box(modifier = Modifier.fillMaxWidth()) {
+                OutlinedTextField(
+                    value = selectedApp?.name ?: "All Apps",
+                    onValueChange = {},
+                    readOnly = true,
+                    modifier = Modifier.fillMaxWidth(),
+                    label = { Text("Filter by App") },
+                    trailingIcon = {
+                        IconButton(onClick = { expanded = true }) {
+                            Icon(Icons.Default.ArrowDropDown, contentDescription = null)
+                        }
+                    }
+                )
+                DropdownMenu(expanded = expanded, onDismissRequest = { expanded = false }) {
+                    DropdownMenuItem(
+                        text = { Text("All Apps") },
+                        onClick = {
+                            selectedApp = null
+                            expanded = false
+                        }
+                    )
+                    selectedApps.forEach { app ->
+                        DropdownMenuItem(
+                            text = { Text(app.name) },
+                            onClick = {
+                                selectedApp = app
+                                expanded = false
+                            }
+                        )
+                    }
+                }
+            }
+
+            Spacer(modifier = Modifier.height(16.dp))
+
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.SpaceBetween,
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                Text("Recently Captured", style = MaterialTheme.typography.titleMedium)
+                IconButton(onClick = {
+                    refreshHistory()
+                    refreshActive()
+                }) {
+                    Icon(Icons.Default.Settings, contentDescription = "Refresh")
+                }
+            }
+
+            LazyColumn(modifier = Modifier.weight(1f)) {
+                if (activeNotifications.isNotEmpty()) {
+                    item {
+                        Text(
+                            "Active in Tray",
+                            style = MaterialTheme.typography.labelLarge,
+                            color = MaterialTheme.colorScheme.primary,
+                            modifier = Modifier.padding(vertical = 8.dp)
+                        )
+                    }
+                    items(activeNotifications) { entry ->
+                        NotificationHistoryItem(entry, isHistory = false)
+                    }
+                }
+
+                if (historyList.isNotEmpty()) {
+                    item {
+                        Text(
+                            "Saved History",
+                            style = MaterialTheme.typography.labelLarge,
+                            color = MaterialTheme.colorScheme.secondary,
+                            modifier = Modifier.padding(vertical = 8.dp)
+                        )
+                    }
+                    items(historyList) { entry ->
+                        NotificationHistoryItem(entry, isHistory = true)
+                    }
+                }
+
+                if (activeNotifications.isEmpty() && historyList.isEmpty()) {
+                    item {
+                        Card(
+                            modifier = Modifier.fillMaxWidth().padding(top = 32.dp),
+                            colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceVariant)
+                        ) {
+                            Column(modifier = Modifier.padding(16.dp)) {
+                                Text(
+                                    "No notifications found.",
+                                    style = MaterialTheme.typography.titleMedium
+                                )
+                                Spacer(modifier = Modifier.height(8.dp))
+                                Text(
+                                    "1. Ensure the app is selected in 'App Config'.\n" +
+                                    "2. Ensure Notification Access is enabled in 'Home'.\n" +
+                                    "3. iLog only captures notifications that arrive while tracking is active. It cannot read old notifications dismissed before iLog was installed.",
+                                    style = MaterialTheme.typography.bodySmall
+                                )
+                            }
+                        }
+                    }
+                }
+            }
+
+            if (selectedApp != null) {
+                Button(
+                    onClick = {
+                        selectedApp?.let { app ->
+                            historyPrefs.edit().remove(app.packageName).apply()
+                            refreshHistory()
+                        }
+                    },
+                    modifier = Modifier.fillMaxWidth().padding(top = 8.dp),
+                    colors = ButtonDefaults.buttonColors(
+                        containerColor = MaterialTheme.colorScheme.errorContainer,
+                        contentColor = MaterialTheme.colorScheme.onErrorContainer
+                    )
+                ) {
+                    Text("Clear History for ${selectedApp?.name}")
+                }
+            }
+        }
+    }
+}
+
+@Composable
+fun NotificationHistoryItem(entry: NotificationEntry, isHistory: Boolean) {
+    val context = LocalContext.current
+    val sdf = remember { SimpleDateFormat("MMM dd, HH:mm:ss", Locale.getDefault()) }
+
+    Card(
+        modifier = Modifier
+            .fillMaxWidth()
+            .padding(vertical = 4.dp),
+        colors = CardDefaults.cardColors(
+            containerColor = if (isHistory) MaterialTheme.colorScheme.surface else MaterialTheme.colorScheme.primaryContainer.copy(
+                alpha = 0.3f
+            )
+        ),
+        elevation = CardDefaults.cardElevation(defaultElevation = 1.dp)
+    ) {
+        Column(modifier = Modifier.padding(12.dp)) {
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.SpaceBetween
+            ) {
+                Column(modifier = Modifier.weight(1f)) {
+                    Text(
+                        text = entry.title,
+                        style = MaterialTheme.typography.titleSmall,
+                        maxLines = 1
+                    )
+                    Text(
+                        text = entry.packageName,
+                        style = MaterialTheme.typography.labelSmall,
+                        color = MaterialTheme.colorScheme.outline
+                    )
+                }
+                Text(
+                    text = sdf.format(Date(entry.postTime)),
+                    style = MaterialTheme.typography.labelSmall,
+                    color = MaterialTheme.colorScheme.outline
+                )
+            }
+            Spacer(modifier = Modifier.height(4.dp))
+            Text(
+                text = entry.text,
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant
+            )
+
+            Row(
+                modifier = Modifier.fillMaxWidth().padding(top = 8.dp),
+                horizontalArrangement = Arrangement.End
+            ) {
+                TextButton(onClick = {
+                    val examplesPrefs = context.getSharedPreferences("iLogExamples", Context.MODE_PRIVATE)
+                    examplesPrefs.edit()
+                        .putString("${entry.packageName}_title", entry.title)
+                        .putString("${entry.packageName}_text", entry.text)
+                        .apply()
+                }) {
+                    Text("Use as Example", style = MaterialTheme.typography.labelMedium)
+                }
+            }
+        }
     }
 }
 
@@ -1204,7 +1852,11 @@ fun ExtractionRuleEditorDialog(
             }
         },
         text = {
-            Column(modifier = Modifier.verticalScroll(rememberScrollState())) {
+            Column(
+                modifier = Modifier
+                    .verticalScroll(rememberScrollState())
+                    .imePadding()
+            ) {
                 Text(
                     "Extracts a part of the text that matches a rule.",
                     style = MaterialTheme.typography.bodySmall,
@@ -1489,7 +2141,7 @@ fun ExtractionRuleEditorDialog(
                 }
 
                 if (isValid) {
-                    onConfirm(ExtractionRule(varName, regex, source, matchType, fixedValue, dataType))
+                    onConfirm(ExtractionRule(varName.trim(), regex, source, matchType, fixedValue, dataType))
                 } else {
                     errorMessage = if (result == null) "No match found for validation" 
                     else "Value '$result' is not a valid $dataType"
@@ -1508,7 +2160,7 @@ fun ExtractionRuleEditorDialog(
 
 fun isNotificationServiceEnabled(context: Context): Boolean {
     val pkgName = context.packageName
-    val flat = Settings.Secure.getString(context.contentResolver, "enabled_notification_listeners")
+    val flat = AndroidSettings.Secure.getString(context.contentResolver, "enabled_notification_listeners")
     if (!TextUtils.isEmpty(flat)) {
         val names = flat.split(":").toTypedArray()
         for (name in names) {

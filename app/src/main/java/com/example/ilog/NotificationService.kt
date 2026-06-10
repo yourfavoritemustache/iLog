@@ -16,12 +16,60 @@ import kotlinx.serialization.Serializable
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.buildJsonObject
 import kotlinx.serialization.json.put
+import kotlinx.serialization.encodeToString
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
 
+@Serializable
+data class NotificationEntry(
+    val title: String,
+    val text: String,
+    val postTime: Long,
+    val packageName: String = ""
+)
 
 class NotificationService : NotificationListenerService() {
+
+    companion object {
+        private var instance: NotificationService? = null
+        fun getActiveNotifications(): Array<StatusBarNotification>? {
+            return instance?.activeNotifications
+        }
+    }
+
+    override fun onListenerConnected() {
+        super.onListenerConnected()
+        instance = this
+        AppLog.d(this, TAG, "Notification Listener Connected")
+        
+        // Backfill history with currently active notifications for selected apps
+        try {
+            val sharedPrefs = getSharedPreferences("iLogPrefs", MODE_PRIVATE)
+            val selectedApps = sharedPrefs.getStringSet("selected_apps", emptySet()) ?: emptySet()
+            
+            activeNotifications?.forEach { sbn ->
+                if (sbn.packageName in selectedApps) {
+                    val extras = sbn.notification.extras
+                    val title = (extras.getString("android.title") ?: "").replace("\n", " ")
+                    val text = (extras.getCharSequence("android.text")?.toString() ?: "").replace("\n", " ")
+                    saveToHistory(sbn.packageName, title, text, sbn.postTime)
+                }
+            }
+        } catch (e: Exception) {
+            AppLog.e(this, TAG, "Failed to backfill history", e)
+        }
+    }
+
+    override fun onCreate() {
+        super.onCreate()
+        instance = this
+    }
+
+    override fun onDestroy() {
+        super.onDestroy()
+        instance = null
+    }
 
     private val scope = CoroutineScope(Dispatchers.IO)
     private val TAG = "NotificationService"
@@ -92,6 +140,9 @@ class NotificationService : NotificationListenerService() {
             packageName
         }
 
+        // Save to local history
+        saveToHistory(packageName, title, text, sbn.postTime)
+
         // Compilation of variables
         val rulesPrefs = getSharedPreferences("iLogRules", MODE_PRIVATE)
         val rulesJson = rulesPrefs.getString(packageName, "[]") ?: "[]"
@@ -104,7 +155,8 @@ class NotificationService : NotificationListenerService() {
 
         val extractedData = mutableMapOf<String, String>()
         rules.forEach { rule ->
-            if (rule.varName.isNotBlank()) {
+            val varName = rule.varName.trim()
+            if (varName.isNotBlank()) {
                 try {
                     val value = if (rule.source == "Fixed Value") {
                         rule.fixedValue
@@ -132,10 +184,15 @@ class NotificationService : NotificationListenerService() {
                     }
                     
                     if (value != null) {
-                        extractedData[rule.varName.lowercase()] = value
+                        val processedValue = if (rule.dataType == "Number" || rule.dataType == "Decimal") {
+                            parseAmount(value)?.toString() ?: value
+                        } else {
+                            value
+                        }
+                        extractedData[varName.lowercase()] = processedValue
                     }
                 } catch (e: Exception) {
-                    AppLog.e(this, TAG, "Extraction error for ${rule.varName}", e)
+                    AppLog.e(this, TAG, "Extraction error for $varName", e)
                 }
             }
         }
@@ -165,25 +222,46 @@ class NotificationService : NotificationListenerService() {
                 put("raw_notification", fullContent)
             } else {
                 mappings.forEach { mapping ->
-                    if (mapping.key.isNotBlank()) {
-                        var resolvedValue = mapping.valueTemplate
-                        resolutionContext.forEach { (name, value) ->
-                            resolvedValue = resolvedValue.replace("{$name}", value, ignoreCase = true)
+                    val key = mapping.key
+                    if (key.isBlank()) return@forEach
+
+                    var resolvedValue = mapping.valueTemplate
+                    resolutionContext.forEach { (name, value) ->
+                        resolvedValue = resolvedValue.replace("{$name}", value, ignoreCase = true)
+                    }
+                    
+                    // Identify if this is intended to be a numeric field based on key name or template
+                    val isNumericField = key.lowercase().let {
+                        it == "amount" || it.contains("price") || it.contains("total") || it.contains("value")
+                    } || mapping.valueTemplate.lowercase().let {
+                        it.contains("amount") || it.contains("price") || it.contains("total")
+                    }
+
+                    // If it still contains placeholders, it failed to resolve
+                    if (resolvedValue.contains("{") || resolvedValue.contains("}")) {
+                        if (isNumericField) {
+                            put(key, null as Double?)
+                        } else {
+                            put(key, null as String?)
                         }
-                        
+                        return@forEach
+                    }
+
+                    if (isNumericField) {
+                        val parsed = parseAmount(resolvedValue)
+                        if (parsed != null) {
+                            put(key, parsed)
+                        } else {
+                            put(key, null as Double?)
+                        }
+                    } else {
+                        // For non-explicitly numeric fields, try to see if it's a number anyway
+                        // but only if it's a clean number (no extra text)
                         val numericValue = resolvedValue.toDoubleOrNull()
                         if (numericValue != null && !mapping.valueTemplate.contains("{")) {
-                            put(mapping.key, numericValue)
+                            put(key, numericValue)
                         } else {
-                            put(mapping.key, resolvedValue)
-                        }
-                        
-                        if (mapping.valueTemplate.startsWith("{") && mapping.valueTemplate.endsWith("}")) {
-                            val varName = mapping.valueTemplate.substring(1, mapping.valueTemplate.length - 1).lowercase()
-                            if (varName == "amount" || varName.contains("price") || varName.contains("total")) {
-                                val parsed = parseAmount(resolutionContext[varName])
-                                if (parsed != null) put(mapping.key, parsed)
-                            }
+                            put(key, resolvedValue)
                         }
                     }
                 }
@@ -201,13 +279,13 @@ class NotificationService : NotificationListenerService() {
                     val errorMsg = e.message ?: "Unknown error"
                     AppLog.e(this@NotificationService, TAG, "Primary request failed: $errorMsg", e)
                     
-                    // Fallback: Try sending only error info to a basic field
+                    // Fallback: Try sending only notification info
                     try {
                         val fallbackBody = buildJsonObject {
                             put("app_name", appName)
-                            put("raw_notification", "ERROR_POST: $errorMsg | DATA: $finalBody")
+                            put("raw_notification", fullContent)
                         }
-                        AppLog.d(this@NotificationService, TAG, "Attempting fallback request")
+                        AppLog.d(this@NotificationService, TAG, "Attempting clean fallback request")
                         client.from(supabaseTable).insert(fallbackBody)
                         AppLog.d(this@NotificationService, TAG, "Fallback request successful")
                     } catch (e2: Exception) {
@@ -221,21 +299,67 @@ class NotificationService : NotificationListenerService() {
     override fun onNotificationRemoved(sbn: StatusBarNotification) {
     }
 
-    private fun parseAmount(input: String?): Double? {
-        if (input == null) return null
-        val clean = input.filter { it.isDigit() || it == '.' || it == ',' }
-        if (clean.isEmpty()) return null
+    private fun saveToHistory(packageName: String, title: String, text: String, postTime: Long) {
+        val historyPrefs = getSharedPreferences("iLogHistory", MODE_PRIVATE)
+        val historyJson = historyPrefs.getString(packageName, "[]") ?: "[]"
+        try {
+            val history = Json.decodeFromString<List<NotificationEntry>>(historyJson).toMutableList()
+            
+            // Avoid duplicates (same package and time)
+            if (history.any { it.packageName == packageName && it.postTime == postTime }) {
+                return
+            }
 
-        val lastDot = clean.lastIndexOf('.')
-        val lastComma = clean.lastIndexOf(',')
-        val lastSeparatorIndex = maxOf(lastDot, lastComma)
+            history.add(0, NotificationEntry(title, text, postTime, packageName))
+            // Keep last 100 notifications per app
+            val limitedHistory = if (history.size > 100) history.take(100) else history
+            historyPrefs.edit().putString(packageName, Json.encodeToString(limitedHistory)).apply()
+        } catch (e: Exception) {
+            AppLog.e(this, TAG, "Failed to save history for $packageName", e)
+            // If it failed to parse, start fresh
+            val newHistory = listOf(NotificationEntry(title, text, postTime, packageName))
+            historyPrefs.edit().putString(packageName, Json.encodeToString(newHistory)).apply()
+        }
+    }
+}
 
-        return if (lastSeparatorIndex == -1) {
-            clean.toDoubleOrNull()
-        } else {
-            val integerPart = clean.substring(0, lastSeparatorIndex).filter { it.isDigit() }
-            val decimalPart = clean.substring(lastSeparatorIndex + 1).filter { it.isDigit() }
+fun parseAmount(input: String?): Double? {
+    if (input == null) return null
+    val clean = input.filter { it.isDigit() || it == '.' || it == ',' }
+    if (clean.isEmpty()) return null
+
+    val lastDot = clean.lastIndexOf('.')
+    val lastComma = clean.lastIndexOf(',')
+
+    return when {
+        // Both separators exist: the last one is the decimal separator
+        lastDot != -1 && lastComma != -1 -> {
+            val decimalIndex = maxOf(lastDot, lastComma)
+            val integerPart = clean.substring(0, decimalIndex).filter { it.isDigit() }
+            val decimalPart = clean.substring(decimalIndex + 1).filter { it.isDigit() }
             "$integerPart.$decimalPart".toDoubleOrNull()
         }
+        // Only dots exist
+        lastDot != -1 -> {
+            val parts = clean.split('.')
+            // If multiple dots or exactly 3 digits after the dot, likely a thousand separator
+            if (parts.size > 2 || (parts.size == 2 && parts[1].length == 3)) {
+                clean.filter { it.isDigit() }.toDoubleOrNull()
+            } else {
+                clean.toDoubleOrNull()
+            }
+        }
+        // Only commas exist
+        lastComma != -1 -> {
+            val parts = clean.split(',')
+            // If multiple commas or exactly 3 digits after the comma, likely a thousand separator
+            if (parts.size > 2 || (parts.size == 2 && parts[1].length == 3)) {
+                clean.filter { it.isDigit() }.toDoubleOrNull()
+            } else {
+                // Otherwise treat comma as decimal separator
+                clean.replace(',', '.').toDoubleOrNull()
+            }
+        }
+        else -> clean.toDoubleOrNull()
     }
 }
