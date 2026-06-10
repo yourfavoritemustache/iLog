@@ -27,6 +27,8 @@ import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.pager.HorizontalPager
+import androidx.compose.foundation.pager.rememberPagerState
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
@@ -40,6 +42,7 @@ import androidx.compose.material.icons.filled.KeyboardArrowDown
 import androidx.compose.material.icons.filled.KeyboardArrowUp
 import androidx.compose.material.icons.filled.MoreVert
 import androidx.compose.material.icons.filled.Settings
+import androidx.compose.material.icons.filled.Share
 import androidx.compose.material.icons.filled.Warning
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
@@ -144,8 +147,9 @@ class MainActivity : ComponentActivity() {
 
 @Composable
 fun MainContainer() {
-    var selectedTabIndex by remember { mutableStateOf(0) }
     val tabs = listOf("Home", "Database", "App Config", "Test Send", "History", "Debug Logs")
+    val pagerState = rememberPagerState(pageCount = { tabs.size })
+    val scope = rememberCoroutineScope()
 
     Scaffold(
         modifier = Modifier.fillMaxSize(),
@@ -153,13 +157,17 @@ fun MainContainer() {
             Column {
                 Spacer(modifier = Modifier.height(32.dp))
                 ScrollableTabRow(
-                    selectedTabIndex = selectedTabIndex,
+                    selectedTabIndex = pagerState.currentPage,
                     edgePadding = 16.dp
                 ) {
                     tabs.forEachIndexed { index, title ->
                         Tab(
-                            selected = selectedTabIndex == index,
-                            onClick = { selectedTabIndex = index },
+                            selected = pagerState.currentPage == index,
+                            onClick = {
+                                scope.launch {
+                                    pagerState.animateScrollToPage(index)
+                                }
+                            },
                             text = { Text(title) }
                         )
                     }
@@ -167,13 +175,15 @@ fun MainContainer() {
             }
         }
     ) { innerPadding ->
-        Box(
+        HorizontalPager(
+            state = pagerState,
             modifier = Modifier
                 .padding(innerPadding)
                 .consumeWindowInsets(innerPadding)
-                .imePadding()
-        ) {
-            when (selectedTabIndex) {
+                .imePadding(),
+            verticalAlignment = Alignment.Top
+        ) { page ->
+            when (page) {
                 0 -> HomeScreen()
                 1 -> DatabaseConfigScreen()
                 2 -> AppConfigScreen()
@@ -195,7 +205,7 @@ fun HomeScreen() {
     var isHibernationDisabled by remember { mutableStateOf(isHibernationDisabled(context)) }
     var showPermissionDialog by remember { mutableStateOf(false) }
 
-    val allSystemsGo = isPermissionEnabled && !isBatteryOptimized
+    val allSystemsGo = isPermissionEnabled && !isBatteryOptimized && isHibernationDisabled
 
     DisposableEffect(lifecycleOwner) {
         val observer = LifecycleEventObserver { _, event ->
@@ -392,10 +402,40 @@ fun isBatteryOptimized(context: Context): Boolean {
 }
 
 fun isHibernationDisabled(context: Context): Boolean {
-    return if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
-        context.packageManager.isAutoRevokeWhitelisted
-    } else {
-        true
+    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+        // 1. Whitelisted by user
+        if (context.packageManager.isAutoRevokeWhitelisted) return true
+
+        // 2. Improved Detection: If we have no dangerous permissions,
+        // Android disables the hibernation toggle anyway (nothing to revoke).
+        if (!hasDangerousPermissions(context)) return true
+
+        // 3. Simplified UI: If battery is unrestricted, we treat the reliability
+        // section as successful as it's the most critical factor.
+        if (!isBatteryOptimized(context)) return true
+
+        return false
+    }
+    return true
+}
+
+fun hasDangerousPermissions(context: Context): Boolean {
+    return try {
+        val pm = context.packageManager
+        val info = pm.getPackageInfo(context.packageName, android.content.pm.PackageManager.GET_PERMISSIONS)
+        val requestedPermissions = info.requestedPermissions ?: return false
+
+        requestedPermissions.any { permission ->
+            try {
+                val pInfo = pm.getPermissionInfo(permission, 0)
+                (pInfo.protectionLevel and android.content.pm.PermissionInfo.PROTECTION_MASK_BASE) ==
+                        android.content.pm.PermissionInfo.PROTECTION_DANGEROUS
+            } catch (e: Exception) {
+                false
+            }
+        }
+    } catch (e: Exception) {
+        false
     }
 }
 
@@ -1264,6 +1304,7 @@ fun NotificationHistoryItem(entry: NotificationEntry, isHistory: Boolean) {
 fun DebugLogsScreen() {
     val context = LocalContext.current
     var logs by remember { mutableStateOf(AppLog.getLogs(context)) }
+    var showClearConfirm by remember { mutableStateOf(false) }
 
     Column(modifier = Modifier.fillMaxSize().padding(16.dp)) {
         Row(
@@ -1272,24 +1313,16 @@ fun DebugLogsScreen() {
             verticalAlignment = Alignment.CenterVertically
         ) {
             Text(text = "Debug Logs", style = MaterialTheme.typography.titleMedium)
-            Row {
-                IconButton(onClick = {
-                    val sendIntent: Intent = Intent().apply {
-                        action = Intent.ACTION_SEND
-                        putExtra(Intent.EXTRA_TEXT, logs)
-                        type = "text/plain"
-                    }
-                    val shareIntent = Intent.createChooser(sendIntent, null)
-                    context.startActivity(shareIntent)
-                }) {
-                    Icon(Icons.Default.Info, contentDescription = "Share Logs")
+            IconButton(onClick = {
+                val sendIntent: Intent = Intent().apply {
+                    action = Intent.ACTION_SEND
+                    putExtra(Intent.EXTRA_TEXT, logs)
+                    type = "text/plain"
                 }
-                IconButton(onClick = {
-                    AppLog.clearLogs(context)
-                    logs = AppLog.getLogs(context)
-                }) {
-                    Icon(Icons.Default.Delete, contentDescription = "Clear Logs")
-                }
+                val shareIntent = Intent.createChooser(sendIntent, null)
+                context.startActivity(shareIntent)
+            }) {
+                Icon(Icons.Default.Share, contentDescription = "Share Logs")
             }
         }
         
@@ -1301,20 +1334,53 @@ fun DebugLogsScreen() {
             shape = MaterialTheme.shapes.medium
         ) {
             Box(modifier = Modifier.padding(8.dp).verticalScroll(rememberScrollState())) {
-                Text(
-                    text = logs,
-                    style = MaterialTheme.typography.bodySmall,
-                    fontFamily = androidx.compose.ui.text.font.FontFamily.Monospace
-                )
+                if (logs.isEmpty()) {
+                    Text(
+                        text = "No logs yet.",
+                        style = MaterialTheme.typography.bodySmall,
+                        modifier = Modifier.padding(16.dp)
+                    )
+                } else {
+                    Text(
+                        text = logs,
+                        style = MaterialTheme.typography.bodySmall,
+                        fontFamily = androidx.compose.ui.text.font.FontFamily.Monospace
+                    )
+                }
             }
         }
         
-        Button(
-            onClick = { logs = AppLog.getLogs(context) },
-            modifier = Modifier.fillMaxWidth().padding(top = 8.dp)
+        Row(
+            modifier = Modifier.fillMaxWidth().padding(top = 8.dp),
+            horizontalArrangement = Arrangement.spacedBy(8.dp)
         ) {
-            Text("Refresh")
+            Button(
+                onClick = { logs = AppLog.getLogs(context) },
+                modifier = Modifier.weight(1f)
+            ) {
+                Text("Refresh")
+            }
+            
+            OutlinedButton(
+                onClick = { showClearConfirm = true },
+                modifier = Modifier.weight(1f),
+                colors = ButtonDefaults.outlinedButtonColors(contentColor = MaterialTheme.colorScheme.error)
+            ) {
+                Text("Clear Logs")
+            }
         }
+    }
+
+    if (showClearConfirm) {
+        ConfirmationDialog(
+            title = "Clear Logs",
+            text = "Are you sure you want to delete all debug logs? This action cannot be undone.",
+            onConfirm = {
+                AppLog.clearLogs(context)
+                logs = AppLog.getLogs(context)
+            },
+            onDismiss = { showClearConfirm = false }
+        )
     }
 }
 
