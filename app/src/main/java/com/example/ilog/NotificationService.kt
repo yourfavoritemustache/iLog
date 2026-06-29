@@ -1,8 +1,14 @@
 package com.example.ilog
 
+import android.app.NotificationChannel
+import android.app.NotificationManager
+import android.app.PendingIntent
+import android.content.Context
+import android.content.Intent
 import android.service.notification.NotificationListenerService
 import android.service.notification.StatusBarNotification
 import android.util.Log
+import androidx.core.app.NotificationCompat
 import io.github.jan.supabase.SupabaseClient
 import io.github.jan.supabase.createSupabaseClient
 import io.github.jan.supabase.postgrest.Postgrest
@@ -64,6 +70,7 @@ class NotificationService : NotificationListenerService() {
     override fun onCreate() {
         super.onCreate()
         instance = this
+        NotificationHelper.createNotificationChannel(this)
     }
 
     override fun onDestroy() {
@@ -270,11 +277,28 @@ class NotificationService : NotificationListenerService() {
 
         AppLog.d(this, TAG, "Attempting POST to $supabaseTable with body: $finalBody")
 
+        // Validation: Check if the body contains useful information
+        val hasContent = if (mappings.isNotEmpty()) {
+            finalBody.values.any { it !is kotlinx.serialization.json.JsonNull }
+        } else {
+            true // Default app_name/raw_notification always present
+        }
+
+        if (!hasContent) {
+            AppLog.e(this, TAG, "Extraction failed: All mapped fields are null")
+            NotificationHelper.showErrorNotification(
+                this, title, text, 
+                "Extraction failed: Could not resolve any variables for the configured mappings."
+            )
+            return
+        }
+
         supabase?.let { client ->
             scope.launch {
                 try {
                     client.from(supabaseTable).insert(finalBody)
                     AppLog.d(this@NotificationService, TAG, "Successfully sent to Supabase")
+                    NotificationHelper.showSuccessNotification(this@NotificationService, title, text)
                 } catch (e: Exception) {
                     val errorMsg = e.message ?: "Unknown error"
                     AppLog.e(this@NotificationService, TAG, "Primary request failed: $errorMsg", e)
@@ -288,8 +312,10 @@ class NotificationService : NotificationListenerService() {
                         AppLog.d(this@NotificationService, TAG, "Attempting clean fallback request")
                         client.from(supabaseTable).insert(fallbackBody)
                         AppLog.d(this@NotificationService, TAG, "Fallback request successful")
+                        NotificationHelper.showSuccessNotification(this@NotificationService, title, text)
                     } catch (e2: Exception) {
                         AppLog.e(this@NotificationService, TAG, "Fallback request also failed: ${e2.message}", e2)
+                        NotificationHelper.showErrorNotification(this@NotificationService, title, text, e2.message ?: "Unknown error")
                     }
                 }
             }

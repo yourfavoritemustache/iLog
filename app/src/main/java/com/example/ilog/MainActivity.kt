@@ -1,8 +1,10 @@
 package com.example.ilog
 
+import android.Manifest
 import android.content.ComponentName
 import android.content.Context
 import android.content.Intent
+import android.content.pm.PackageManager
 import android.net.Uri
 import android.os.Build
 import android.os.Bundle
@@ -10,8 +12,10 @@ import android.os.PowerManager
 import android.provider.Settings as AndroidSettings
 import android.text.TextUtils
 import androidx.activity.ComponentActivity
+import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
+import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -36,6 +40,7 @@ import androidx.compose.material.icons.filled.Add
 import androidx.compose.material.icons.filled.CheckCircle
 import androidx.compose.material.icons.filled.Delete
 import androidx.compose.material.icons.filled.ArrowDropDown
+import androidx.compose.material.icons.filled.Refresh
 import androidx.compose.material.icons.filled.Edit
 import androidx.compose.material.icons.filled.Info
 import androidx.compose.material.icons.filled.KeyboardArrowDown
@@ -84,6 +89,7 @@ import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalLifecycleOwner
 import androidx.compose.ui.text.input.PasswordVisualTransformation
 import androidx.compose.ui.unit.dp
+import androidx.core.content.ContextCompat
 import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.LifecycleEventObserver
 import com.example.ilog.ui.theme.ILogTheme
@@ -137,6 +143,7 @@ class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         enableEdgeToEdge()
+        NotificationHelper.createNotificationChannel(this)
         setContent {
             ILogTheme {
                 MainContainer()
@@ -201,16 +208,32 @@ fun HomeScreen() {
     val lifecycleOwner = LocalLifecycleOwner.current
     
     var isPermissionEnabled by remember { mutableStateOf(isNotificationServiceEnabled(context)) }
+    var isPostNotificationGranted by remember { 
+        mutableStateOf(
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                ContextCompat.checkSelfPermission(context, Manifest.permission.POST_NOTIFICATIONS) == PackageManager.PERMISSION_GRANTED
+            } else true
+        )
+    }
     var isBatteryOptimized by remember { mutableStateOf(isBatteryOptimized(context)) }
     var isHibernationDisabled by remember { mutableStateOf(isHibernationDisabled(context)) }
     var showPermissionDialog by remember { mutableStateOf(false) }
 
-    val allSystemsGo = isPermissionEnabled && !isBatteryOptimized && isHibernationDisabled
+    val allSystemsGo = isPermissionEnabled && isPostNotificationGranted && !isBatteryOptimized && isHibernationDisabled
+
+    val permissionLauncher = rememberLauncherForActivityResult(
+        ActivityResultContracts.RequestPermission()
+    ) { isGranted ->
+        isPostNotificationGranted = isGranted
+    }
 
     DisposableEffect(lifecycleOwner) {
         val observer = LifecycleEventObserver { _, event ->
             if (event == Lifecycle.Event.ON_RESUME) {
                 isPermissionEnabled = isNotificationServiceEnabled(context)
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                    isPostNotificationGranted = ContextCompat.checkSelfPermission(context, Manifest.permission.POST_NOTIFICATIONS) == PackageManager.PERMISSION_GRANTED
+                }
                 isBatteryOptimized = isBatteryOptimized(context)
                 isHibernationDisabled = isHibernationDisabled(context)
                 if (!isPermissionEnabled) {
@@ -284,6 +307,18 @@ fun HomeScreen() {
                 context.startActivity(Intent("android.settings.ACTION_NOTIFICATION_LISTENER_SETTINGS"))
             }
         )
+
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+            Spacer(modifier = Modifier.height(16.dp))
+            SettingsItem(
+                title = "Success Notifications",
+                description = "Shows a status alert when data is successfully saved to Supabase.",
+                isCompleted = isPostNotificationGranted,
+                onClick = {
+                    permissionLauncher.launch(Manifest.permission.POST_NOTIFICATIONS)
+                }
+            )
+        }
         
         Spacer(modifier = Modifier.height(16.dp))
         
@@ -644,8 +679,7 @@ fun SupabaseConfigSection() {
     var isLoadingTables by remember { mutableStateOf(false) }
     var tableMenuExpanded by remember { mutableStateOf(false) }
 
-    // Fetch tables when URL and Key are available
-    LaunchedEffect(url, key) {
+    fun refreshTables() {
         if (url.isNotBlank() && key.isNotBlank()) {
             isLoadingTables = true
             scope.launch(Dispatchers.IO) {
@@ -667,6 +701,11 @@ fun SupabaseConfigSection() {
                 }
             }
         }
+    }
+
+    // Fetch tables when URL and Key are available
+    LaunchedEffect(url, key) {
+        refreshTables()
     }
 
     Card(
@@ -707,8 +746,13 @@ fun SupabaseConfigSection() {
                         modifier = Modifier.fillMaxWidth(),
                         label = { Text(if (isLoadingTables) "Loading tables..." else "Select or Type Table Name") },
                         trailingIcon = {
-                            IconButton(onClick = { tableMenuExpanded = true }) {
-                                Icon(Icons.Default.ArrowDropDown, contentDescription = null)
+                            Row {
+                                IconButton(onClick = { refreshTables() }, enabled = !isLoadingTables) {
+                                    Icon(Icons.Default.Refresh, contentDescription = "Refresh Tables")
+                                }
+                                IconButton(onClick = { tableMenuExpanded = true }) {
+                                    Icon(Icons.Default.ArrowDropDown, contentDescription = null)
+                                }
                             }
                         }
                     )
@@ -756,26 +800,42 @@ private suspend fun fetchSupabaseSchema(url: String, key: String): Pair<List<Str
         
         try {
             val restUrl = if (url.endsWith("/")) "${url}rest/v1/" else "$url/rest/v1/"
-            val connection = URL("${restUrl}?select=name").openConnection() as HttpsURLConnection
+            val connection = URL(restUrl).openConnection() as HttpsURLConnection
             connection.setRequestProperty("apikey", key)
             connection.setRequestProperty("Authorization", "Bearer $key")
+            connection.requestMethod = "GET"
+            connection.connectTimeout = 10000
+            connection.readTimeout = 10000
             
-            // This is a simplified way to get tables, usually you might use a specific RPC or just let user type
-            // For now, let's assume we can fetch some metadata or just return a default list if it fails
-            
-            // In a real app, you'd use the Postgrest client to query information_schema
-            // For this demo, we'll return some common table names if the fetch fails
-            tables.add("transaction_fact_android")
-            tables.add("notifications_raw")
-            
-            columnsMap["transaction_fact_android"] = listOf("id", "created_at", "amount", "currency", "merchant", "category", "raw_text", "app_package")
-            columnsMap["notifications_raw"] = listOf("id", "created_at", "package_name", "title", "text", "post_time")
-            
+            if (connection.responseCode == 200) {
+                val response = connection.inputStream.bufferedReader().use { it.readText() }
+                val json = Json.decodeFromString<JsonObject>(response)
+                val definitions = json["definitions"]?.jsonObject
+                
+                definitions?.forEach { (tableName, definition) ->
+                    tables.add(tableName)
+                    val properties = definition.jsonObject["properties"]?.jsonObject
+                    val columns = properties?.keys?.toList() ?: emptyList()
+                    columnsMap[tableName] = columns
+                }
+            }
         } catch (e: Exception) {
             e.printStackTrace()
         }
         
-        Pair(tables, columnsMap)
+        // If we failed to get anything from the API, we keep the default expected tables
+        // so the user has something to work with if their API is restricted
+        if (tables.isEmpty()) {
+            tables.add("transaction_fact_android")
+            tables.add("notifications_raw")
+            tables.add("user_backups")
+            
+            columnsMap["transaction_fact_android"] = listOf("id", "created_at", "amount", "currency", "merchant", "category", "raw_text", "app_package")
+            columnsMap["notifications_raw"] = listOf("id", "created_at", "package_name", "title", "text", "post_time")
+            columnsMap["user_backups"] = listOf("backup_key", "data", "created_at")
+        }
+        
+        Pair(tables.sorted(), columnsMap)
     }
 }
 
@@ -1020,13 +1080,29 @@ private suspend fun performTestSend(
         }
     }
 
+    // Validation
+    val hasContent = if (mappings.isNotEmpty()) {
+        finalBody.values.any { it !is kotlinx.serialization.json.JsonNull }
+    } else {
+        true
+    }
+
+    if (!hasContent) {
+        val errorMsg = "Extraction failed: Could not resolve any variables for mappings."
+        NotificationHelper.showErrorNotification(context, title, text, errorMsg)
+        return "Error: $errorMsg"
+    }
+
     return try {
         val client = createSupabaseClient(url, key) { install(Postgrest) }
         client.from(table).insert(finalBody)
+        NotificationHelper.showSuccessNotification(context, title, text)
         "Success! Sent to $table"
     } catch (e: Exception) {
-        AppLog.e(context, "TestSend", "Failed to send test", e)
-        "Error: ${e.message}"
+        val errorMsg = e.message ?: "Unknown error"
+        AppLog.e(context, "TestSend", "Failed to send test: $errorMsg", e)
+        NotificationHelper.showErrorNotification(context, title, text, errorMsg)
+        "Error: $errorMsg"
     }
 }
 
