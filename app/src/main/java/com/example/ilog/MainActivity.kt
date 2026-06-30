@@ -4,11 +4,13 @@ import android.Manifest
 import android.content.ComponentName
 import android.content.Context
 import android.content.Intent
+import android.content.pm.LauncherApps
 import android.content.pm.PackageManager
 import android.net.Uri
 import android.os.Build
 import android.os.Bundle
 import android.os.PowerManager
+import android.os.UserManager
 import android.provider.Settings as AndroidSettings
 import android.text.TextUtils
 import androidx.activity.ComponentActivity
@@ -16,6 +18,7 @@ import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
 import androidx.activity.result.contract.ActivityResultContracts
+import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -154,6 +157,20 @@ class MainActivity : ComponentActivity() {
 
 @Composable
 fun MainContainer() {
+    val context = LocalContext.current
+    val sharedPrefs = remember { context.getSharedPreferences("iLogPrefs", Context.MODE_PRIVATE) }
+    
+    // Migrate old selected_apps format to new pkg_userHash format
+    LaunchedEffect(Unit) {
+        val current = sharedPrefs.getStringSet("selected_apps", emptySet()) ?: emptySet()
+        val migrated = current.map { key ->
+            if (!key.contains("_")) "${key}_0" else key
+        }.toSet()
+        if (migrated != current) {
+            sharedPrefs.edit().putStringSet("selected_apps", migrated).apply()
+        }
+    }
+
     val tabs = listOf("Home", "Database", "App Config", "Test Send", "History", "Debug Logs")
     val pagerState = rememberPagerState(pageCount = { tabs.size })
     val scope = rememberCoroutineScope()
@@ -188,7 +205,8 @@ fun MainContainer() {
                 .padding(innerPadding)
                 .consumeWindowInsets(innerPadding)
                 .imePadding(),
-            verticalAlignment = Alignment.Top
+            verticalAlignment = Alignment.Top,
+            beyondViewportPageCount = 1
         ) { page ->
             when (page) {
                 0 -> HomeScreen()
@@ -849,20 +867,62 @@ fun TestSendScreen() {
     val encryptedPrefs = remember { SecurityUtils.getEncryptedPrefs(context) }
     val scope = rememberCoroutineScope()
 
+    val lifecycleOwner = LocalLifecycleOwner.current
     var selectedPackageNames by remember { 
         mutableStateOf(sharedPrefs.getStringSet("selected_apps", emptySet()) ?: emptySet()) 
     }
 
-    val pm = context.packageManager
-    val selectedApps = remember(selectedPackageNames) {
-        selectedPackageNames.map { pkg ->
-            try {
-                val ai = pm.getApplicationInfo(pkg, 0)
-                AppInfo(pm.getApplicationLabel(ai).toString(), pkg)
-            } catch (e: Exception) {
-                AppInfo(pkg, pkg)
+    DisposableEffect(lifecycleOwner) {
+        val observer = LifecycleEventObserver { _, event ->
+            if (event == Lifecycle.Event.ON_RESUME) {
+                selectedPackageNames = sharedPrefs.getStringSet("selected_apps", emptySet()) ?: emptySet()
             }
-        }.sortedBy { it.name }
+        }
+        lifecycleOwner.lifecycle.addObserver(observer)
+        onDispose { lifecycleOwner.lifecycle.removeObserver(observer) }
+    }
+
+    var selectedApps by remember { mutableStateOf<List<AppInfo>>(emptyList()) }
+    var isResolvingApps by remember { mutableStateOf(true) }
+
+    LaunchedEffect(selectedPackageNames) {
+        val apps = withContext(Dispatchers.IO) {
+            val userManager = context.getSystemService(Context.USER_SERVICE) as UserManager
+            val launcherApps = context.getSystemService(Context.LAUNCHER_APPS_SERVICE) as LauncherApps
+            val pm = context.packageManager
+
+            selectedPackageNames.map { key ->
+                val parts = key.split("_")
+                val pkg = parts[0]
+                val userHash = parts.getOrNull(1)?.toIntOrNull() ?: 0
+                
+                val user = userManager.userProfiles.find { 
+                    userManager.getSerialNumberForUser(it).toInt() == userHash 
+                } ?: android.os.Process.myUserHandle()
+
+                try {
+                    val launcherActivities = launcherApps.getActivityList(pkg, user)
+                    if (launcherActivities.isNotEmpty()) {
+                        val ai = launcherActivities[0].applicationInfo
+                        val name = pm.getApplicationLabel(ai).toString()
+                        val isPrivate = if (Build.VERSION.SDK_INT >= 35) {
+                            try {
+                                val method = UserManager::class.java.getMethod("isPrivateProfile")
+                                method.invoke(userManager) as Boolean
+                            } catch (e: Exception) { false }
+                        } else user != android.os.Process.myUserHandle()
+
+                        AppInfo(name, pkg, isPrivate, userHash)
+                    } else {
+                        AppInfo(pkg, pkg, userHash != 0, userHash)
+                    }
+                } catch (e: Exception) {
+                    AppInfo(pkg, pkg, userHash != 0, userHash)
+                }
+            }.distinctBy { "${it.packageName}_${it.userIdentifier}" }.sortedBy { it.name }
+        }
+        selectedApps = apps
+        isResolvingApps = false
     }
 
     var selectedApp by remember { mutableStateOf<AppInfo?>(null) }
@@ -882,8 +942,12 @@ fun TestSendScreen() {
         } else {
             var expanded by remember { mutableStateOf(false) }
             Box(modifier = Modifier.fillMaxWidth()) {
+                val displayText = selectedApp?.let { 
+                    if (it.isPrivateSpace) "${it.name} (Private Space)" else it.name 
+                } ?: "Select an App"
+                
                 OutlinedTextField(
-                    value = selectedApp?.name ?: "Select an App",
+                    value = displayText,
                     onValueChange = {},
                     readOnly = true,
                     modifier = Modifier.fillMaxWidth(),
@@ -897,7 +961,18 @@ fun TestSendScreen() {
                 DropdownMenu(expanded = expanded, onDismissRequest = { expanded = false }) {
                     selectedApps.forEach { app ->
                         DropdownMenuItem(
-                            text = { Text(app.name) },
+                            text = { 
+                                Column {
+                                    Text(app.name)
+                                    if (app.isPrivateSpace) {
+                                        Text(
+                                            "Private Space",
+                                            style = MaterialTheme.typography.labelSmall,
+                                            color = MaterialTheme.colorScheme.secondary
+                                        )
+                                    }
+                                }
+                            },
                             onClick = {
                                 selectedApp = app
                                 expanded = false
@@ -1113,25 +1188,74 @@ fun NotificationHistoryScreen() {
     val historyPrefs = remember { context.getSharedPreferences("iLogHistory", Context.MODE_PRIVATE) }
     val scope = rememberCoroutineScope()
 
+    val lifecycleOwner = LocalLifecycleOwner.current
     var selectedPackageNames by remember {
         mutableStateOf(sharedPrefs.getStringSet("selected_apps", emptySet()) ?: emptySet())
     }
 
-    val pm = context.packageManager
-    val selectedApps = remember(selectedPackageNames) {
-        selectedPackageNames.map { pkg ->
-            try {
-                val ai = pm.getApplicationInfo(pkg, 0)
-                AppInfo(pm.getApplicationLabel(ai).toString(), pkg)
-            } catch (e: Exception) {
-                AppInfo(pkg, pkg)
+    DisposableEffect(lifecycleOwner) {
+        val observer = LifecycleEventObserver { _, event ->
+            if (event == Lifecycle.Event.ON_RESUME) {
+                selectedPackageNames = sharedPrefs.getStringSet("selected_apps", emptySet()) ?: emptySet()
             }
-        }.sortedBy { it.name }
+        }
+        lifecycleOwner.lifecycle.addObserver(observer)
+        onDispose { lifecycleOwner.lifecycle.removeObserver(observer) }
     }
 
-    var selectedApp by remember { mutableStateOf<AppInfo?>(selectedApps.firstOrNull()) }
+    var selectedApps by remember { mutableStateOf<List<AppInfo>>(emptyList()) }
+    var isResolvingApps by remember { mutableStateOf(true) }
+
+    LaunchedEffect(selectedPackageNames) {
+        val apps = withContext(Dispatchers.IO) {
+            val userManager = context.getSystemService(Context.USER_SERVICE) as UserManager
+            val launcherApps = context.getSystemService(Context.LAUNCHER_APPS_SERVICE) as LauncherApps
+            val pm = context.packageManager
+
+            selectedPackageNames.map { key ->
+                val parts = key.split("_")
+                val pkg = parts[0]
+                val userHash = parts.getOrNull(1)?.toIntOrNull() ?: 0
+                
+                val user = userManager.userProfiles.find { 
+                    userManager.getSerialNumberForUser(it).toInt() == userHash 
+                } ?: android.os.Process.myUserHandle()
+
+                try {
+                    val launcherActivities = launcherApps.getActivityList(pkg, user)
+                    if (launcherActivities.isNotEmpty()) {
+                        val ai = launcherActivities[0].applicationInfo
+                        val name = pm.getApplicationLabel(ai).toString()
+                        val isPrivate = if (Build.VERSION.SDK_INT >= 35) {
+                            try {
+                                val method = UserManager::class.java.getMethod("isPrivateProfile")
+                                method.invoke(userManager) as Boolean
+                            } catch (e: Exception) { false }
+                        } else user != android.os.Process.myUserHandle()
+
+                        AppInfo(name, pkg, isPrivate, userHash)
+                    } else {
+                        AppInfo(pkg, pkg, userHash != 0, userHash)
+                    }
+                } catch (e: Exception) {
+                    AppInfo(pkg, pkg, userHash != 0, userHash)
+                }
+            }.distinctBy { "${it.packageName}_${it.userIdentifier}" }.sortedBy { it.name }
+        }
+        selectedApps = apps
+        isResolvingApps = false
+    }
+
+    var selectedApp by remember { mutableStateOf<AppInfo?>(null) }
     var historyList by remember { mutableStateOf(listOf<NotificationEntry>()) }
     var activeNotifications by remember { mutableStateOf(listOf<NotificationEntry>()) }
+    
+    // Auto-select first app once resolved
+    LaunchedEffect(selectedApps) {
+        if (selectedApp == null && selectedApps.isNotEmpty()) {
+            selectedApp = selectedApps.firstOrNull()
+        }
+    }
 
     fun refreshHistory() {
         val app = selectedApp
@@ -1145,28 +1269,55 @@ fun NotificationHistoryScreen() {
         } else {
             // Load all history
             val allHistory = mutableListOf<NotificationEntry>()
-            selectedPackageNames.forEach { pkg ->
-                val json = historyPrefs.getString(pkg, "[]") ?: "[]"
-                try {
-                    allHistory.addAll(Json.decodeFromString<List<NotificationEntry>>(json))
-                } catch (e: Exception) {}
+            val processedPackages = mutableSetOf<String>()
+            selectedPackageNames.forEach { key ->
+                val pkg = key.split("_")[0]
+                if (pkg !in processedPackages) {
+                    val json = historyPrefs.getString(pkg, "[]") ?: "[]"
+                    try {
+                        allHistory.addAll(Json.decodeFromString<List<NotificationEntry>>(json))
+                    } catch (e: Exception) {}
+                    processedPackages.add(pkg)
+                }
             }
             historyList = allHistory.sortedByDescending { it.postTime }
         }
     }
 
     fun refreshActive() {
+        val userManager = context.getSystemService(Context.USER_SERVICE) as UserManager
         val active = NotificationService.getActiveNotifications()
-        activeNotifications = active?.filter { sbn ->
-            selectedApp == null || sbn.packageName == selectedApp?.packageName
-        }?.map { sbn ->
+        activeNotifications = active?.map { sbn ->
             val extras = sbn.notification.extras
+            val userHash = userManager.getSerialNumberForUser(sbn.user).toInt()
+            
+            // Determine if this is a private space notification
+            var isPrivate = false
+            if (Build.VERSION.SDK_INT >= 35) {
+                try {
+                    val method = UserManager::class.java.getMethod("isPrivateProfile")
+                    isPrivate = method.invoke(userManager) as Boolean
+                } catch (e: Exception) {}
+            }
+            if (!isPrivate && userHash != 0) isPrivate = true
+
             NotificationEntry(
                 title = extras.getString("android.title") ?: "No Title",
                 text = extras.getCharSequence("android.text")?.toString() ?: "No Text",
                 postTime = sbn.postTime,
-                packageName = sbn.packageName
+                packageName = sbn.packageName,
+                userIdentifier = userHash,
+                isPrivateSpace = isPrivate
             )
+        }?.filter { entry ->
+            val appKey = "${entry.packageName}_${entry.userIdentifier}"
+            if (selectedApp == null) {
+                // If "All Apps" is selected, only show apps tracked in App Config
+                selectedPackageNames.contains(appKey)
+            } else {
+                // If a specific app is selected, only show that one
+                entry.packageName == selectedApp?.packageName && entry.userIdentifier == selectedApp?.userIdentifier
+            }
         }?.sortedByDescending { it.postTime } ?: emptyList()
     }
 
@@ -1190,8 +1341,12 @@ fun NotificationHistoryScreen() {
         } else {
             var expanded by remember { mutableStateOf(false) }
             Box(modifier = Modifier.fillMaxWidth()) {
+                val displayText = selectedApp?.let { 
+                    if (it.isPrivateSpace) "${it.name} (Private Space)" else it.name 
+                } ?: "All Apps"
+
                 OutlinedTextField(
-                    value = selectedApp?.name ?: "All Apps",
+                    value = displayText,
                     onValueChange = {},
                     readOnly = true,
                     modifier = Modifier.fillMaxWidth(),
@@ -1212,7 +1367,18 @@ fun NotificationHistoryScreen() {
                     )
                     selectedApps.forEach { app ->
                         DropdownMenuItem(
-                            text = { Text(app.name) },
+                            text = { 
+                                Column {
+                                    Text(app.name)
+                                    if (app.isPrivateSpace) {
+                                        Text(
+                                            "Private Space",
+                                            style = MaterialTheme.typography.labelSmall,
+                                            color = MaterialTheme.colorScheme.secondary
+                                        )
+                                    }
+                                }
+                            },
                             onClick = {
                                 selectedApp = app
                                 expanded = false
@@ -1339,11 +1505,21 @@ fun NotificationHistoryItem(entry: NotificationEntry, isHistory: Boolean) {
                         style = MaterialTheme.typography.titleSmall,
                         maxLines = 1
                     )
-                    Text(
-                        text = entry.packageName,
-                        style = MaterialTheme.typography.labelSmall,
-                        color = MaterialTheme.colorScheme.outline
-                    )
+                    Row(verticalAlignment = Alignment.CenterVertically) {
+                        Text(
+                            text = entry.packageName,
+                            style = MaterialTheme.typography.labelSmall,
+                            color = MaterialTheme.colorScheme.outline
+                        )
+                        if (entry.isPrivateSpace) {
+                            Text(
+                                text = " • Private Space",
+                                style = MaterialTheme.typography.labelSmall,
+                                color = MaterialTheme.colorScheme.secondary,
+                                modifier = Modifier.padding(start = 4.dp)
+                            )
+                        }
+                    }
                 }
                 Text(
                     text = sdf.format(Date(entry.postTime)),
@@ -1495,7 +1671,12 @@ fun NotificationStatusHeader(isEnabled: Boolean) {
     }
 }
 
-data class AppInfo(val name: String, val packageName: String)
+data class AppInfo(
+    val name: String, 
+    val packageName: String,
+    val isPrivateSpace: Boolean = false,
+    val userIdentifier: Int = 0
+)
 
 @Composable
 fun ConfirmationDialog(
@@ -1535,38 +1716,183 @@ fun AppConfigScreen() {
         mutableStateOf(sharedPrefs.getStringSet("selected_apps", emptySet()) ?: emptySet()) 
     }
     
-    val allInstalledApps = remember {
-        val pm = context.packageManager
-        pm.getInstalledApplications(android.content.pm.PackageManager.GET_META_DATA)
-            .filter { app -> 
-                (app.flags and android.content.pm.ApplicationInfo.FLAG_SYSTEM) == 0 || 
-                (app.flags and android.content.pm.ApplicationInfo.FLAG_UPDATED_SYSTEM_APP) != 0
+    var allInstalledApps by remember { mutableStateOf<List<AppInfo>>(emptyList()) }
+    var isLoadingApps by remember { mutableStateOf(true) }
+    var refreshTrigger by remember { mutableStateOf(0) }
+
+    LaunchedEffect(refreshTrigger) {
+        isLoadingApps = true
+        val apps = withContext(Dispatchers.IO) {
+            val list = mutableListOf<AppInfo>()
+            val pm = context.packageManager
+            val userManager = context.getSystemService(Context.USER_SERVICE) as UserManager
+            val launcherApps = context.getSystemService(Context.LAUNCHER_APPS_SERVICE) as LauncherApps
+            
+            // Try getting profiles from both sources to be as exhaustive as possible
+            val profilesFromManager = userManager.userProfiles
+            val profilesFromLauncher = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                launcherApps.profiles
+            } else emptyList()
+            val allProfiles = (profilesFromManager + profilesFromLauncher).distinctBy { it.hashCode() }
+            
+            AppLog.d(context, "AppConfig", "Found ${allProfiles.size} user profiles")
+            
+            val myUserHandle = android.os.Process.myUserHandle()
+            
+            for (user in allProfiles) {
+                val isMainUser = user == myUserHandle
+                val userHash = userManager.getSerialNumberForUser(user).toInt()
+                
+                val isQuiet = try { userManager.isQuietModeEnabled(user) } catch (e: Exception) { false }
+
+                AppLog.d(context, "AppConfig", "Processing profile: $userHash (Main: $isMainUser, Quiet: $isQuiet)")
+
+                // Improved detection for Private Space / Work Profile
+                var isPrivate = false
+                if (Build.VERSION.SDK_INT >= 35) {
+                    try {
+                        val method = UserManager::class.java.getMethod("isPrivateProfile")
+                        isPrivate = method.invoke(userManager) as Boolean
+                    } catch (e: Exception) {}
+                }
+                
+                val isSecondarySpace = !isMainUser
+
+                try {
+                    // 1. Standard Launcher activities
+                    val launcherActivities = try {
+                        launcherApps.getActivityList(null, user)
+                    } catch (e: Exception) {
+                        AppLog.e(context, "AppConfig", "  Failed to get activity list for $userHash: ${e.message}")
+                        emptyList()
+                    }
+                    
+                    AppLog.d(context, "AppConfig", "  Found ${launcherActivities.size} launcher activities for user $userHash")
+                    
+                    launcherActivities.forEach { activity ->
+                        val appInfo = activity.applicationInfo
+                        val name = pm.getApplicationLabel(appInfo).toString()
+                        val pkg = appInfo.packageName
+                        
+                        if (list.none { it.packageName == pkg && it.userIdentifier == userHash }) {
+                            list.add(AppInfo(
+                                name = name,
+                                packageName = pkg,
+                                isPrivateSpace = isPrivate || isSecondarySpace,
+                                userIdentifier = userHash
+                            ))
+                        }
+                    }
+                    
+                    // 2. Scan for specific packages if they were missed (sometimes hidden from launcher)
+                    val commonPackages = listOf(
+                        "com.revolut.revolut", "com.revolut.revolut.business", "com.revolut.business", 
+                        "com.binance.dev", "com.cryptocom.app", "com.coinbase.android",
+                        "com.google.android.apps.nbu.paisa.user", // GPay
+                        "com.paypal.android.p2pmobile", "com.venmo", "com.squareup.cash"
+                    )
+                    commonPackages.forEach { pkg ->
+                        if (list.none { it.packageName == pkg && it.userIdentifier == userHash }) {
+                            try {
+                                // Try to get AppInfo directly - this is often more reliable than isPackageEnabled
+                                // which sometimes requires the app to have a Category Launcher.
+                                val appInfo = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                                    try {
+                                        launcherApps.getApplicationInfo(pkg, 0, user)
+                                    } catch (e: Exception) { null }
+                                } else null
+
+                                if (appInfo != null || launcherApps.isPackageEnabled(pkg, user)) {
+                                    val name = if (appInfo != null) {
+                                        pm.getApplicationLabel(appInfo).toString()
+                                    } else {
+                                        val activities = launcherApps.getActivityList(pkg, user)
+                                        if (activities.isNotEmpty()) {
+                                            pm.getApplicationLabel(activities[0].applicationInfo).toString()
+                                        } else {
+                                            if (pkg.contains("revolut")) "Revolut" else pkg
+                                        }
+                                    }
+                                    
+                                    AppLog.d(context, "AppConfig", "  Manually verified package: $pkg for user $userHash")
+                                    list.add(AppInfo(
+                                        name = name,
+                                        packageName = pkg,
+                                        isPrivateSpace = isPrivate || isSecondarySpace,
+                                        userIdentifier = userHash
+                                    ))
+                                }
+                            } catch (e: Exception) {}
+                        }
+                    }
+                } catch (e: Exception) {
+                    AppLog.e(context, "AppConfig", "  Error fetching apps for user $userHash", e)
+                }
             }
-            .map { AppInfo(pm.getApplicationLabel(it).toString(), it.packageName) }
-            .sortedBy { it.name }
+            
+            // 3. Fallback: Add already selected apps even if they are not currently visible 
+            // (e.g. if the space was locked during scan but we have them in prefs)
+            selectedPackageNames.forEach { key ->
+                val parts = key.split("_")
+                val pkg = parts[0]
+                val userHash = parts.getOrNull(1)?.toIntOrNull() ?: 0
+                
+                if (list.none { it.packageName == pkg && it.userIdentifier == userHash }) {
+                    // Try to resolve name from existing list or use package
+                    list.add(AppInfo(pkg, pkg, userHash != 0, userHash))
+                }
+            }
+
+            list.sortedWith(compareBy({ it.name }, { it.isPrivateSpace }))
+        }
+        allInstalledApps = apps
+        isLoadingApps = false
     }
 
-    val selectedApps = allInstalledApps.filter { it.packageName in selectedPackageNames }
+    val selectedApps = remember(allInstalledApps, selectedPackageNames) {
+        allInstalledApps.filter { 
+            "${it.packageName}_${it.userIdentifier}" in selectedPackageNames 
+        }
+    }
 
     Column(modifier = Modifier.fillMaxSize()) {
-        Button(
-            onClick = { showSelector = true },
+        Row(
             modifier = Modifier
                 .fillMaxWidth()
-                .padding(16.dp)
+                .padding(horizontal = 16.dp, vertical = 8.dp),
+            horizontalArrangement = Arrangement.spacedBy(8.dp)
         ) {
-            Icon(Icons.Default.Add, contentDescription = null)
-            Spacer(modifier = Modifier.width(8.dp))
-            Text("Select Apps to Track")
+            Button(
+                onClick = { showSelector = true },
+                modifier = Modifier.weight(1f),
+                enabled = !isLoadingApps
+            ) {
+                Icon(Icons.Default.Add, contentDescription = null)
+                Spacer(modifier = Modifier.width(8.dp))
+                Text(if (isLoadingApps) "Loading..." else "Add Apps")
+            }
+            
+            OutlinedButton(
+                onClick = { refreshTrigger++ },
+                modifier = Modifier.weight(0.5f),
+                enabled = !isLoadingApps
+            ) {
+                Icon(Icons.Default.Refresh, contentDescription = "Refresh")
+                Text("Refresh")
+            }
         }
 
-        if (selectedApps.isEmpty()) {
+        if (isLoadingApps) {
+            Box(modifier = Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
+                androidx.compose.material3.CircularProgressIndicator()
+            }
+        } else if (selectedApps.isEmpty()) {
             Box(modifier = Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
                 Text("No apps selected. Click the button above to add apps.")
             }
         } else {
             LazyColumn(modifier = Modifier.fillMaxSize()) {
-                items(selectedApps, key = { it.packageName }) { app ->
+                items(selectedApps, key = { "${it.packageName}_${it.userIdentifier}" }) { app ->
                     AppConfigItem(app, true) { isChecked ->
                         if (!isChecked) {
                             appToDelete = app
@@ -1580,9 +1906,10 @@ fun AppConfigScreen() {
     appToDelete?.let { app ->
         ConfirmationDialog(
             title = "Remove App",
-            text = "Are you sure you want to stop tracking ${app.name}? This will not delete your rules, but the app will no longer be processed.",
+            text = "Are you sure you want to stop tracking ${app.name}${if (app.isPrivateSpace) " (Private Space)" else ""}? This will not delete your rules, but the app will no longer be processed.",
             onConfirm = {
-                val newSelection = selectedPackageNames - app.packageName
+                val appKey = "${app.packageName}_${app.userIdentifier}"
+                val newSelection = selectedPackageNames - appKey
                 selectedPackageNames = newSelection
                 sharedPrefs.edit().putStringSet("selected_apps", newSelection).apply()
             },
@@ -1591,32 +1918,106 @@ fun AppConfigScreen() {
     }
 
     if (showSelector) {
+        var manualPkg by remember { mutableStateOf("") }
+        var manualUserHash by remember { mutableStateOf(0) }
+        var showManualEntry by remember { mutableStateOf(false) }
+
         AlertDialog(
             onDismissRequest = { showSelector = false },
-            title = { Text("Select Apps") },
+            title = { 
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.SpaceBetween,
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    Text("Select Apps")
+                    TextButton(onClick = { showManualEntry = !showManualEntry }) {
+                        Text(if (showManualEntry) "Show List" else "Manual Entry")
+                    }
+                }
+            },
             text = {
-                LazyColumn(modifier = Modifier.height(400.dp)) {
-                    items(allInstalledApps, key = { it.packageName }) { app ->
-                        val isChecked = selectedPackageNames.contains(app.packageName)
-                        Row(
-                            modifier = Modifier
-                                .fillMaxWidth()
-                                .padding(vertical = 8.dp),
-                            verticalAlignment = Alignment.CenterVertically
-                        ) {
-                            Checkbox(
-                                checked = isChecked,
-                                onCheckedChange = { checked ->
-                                    val newSelection = if (checked) {
-                                        selectedPackageNames + app.packageName
-                                    } else {
-                                        selectedPackageNames - app.packageName
-                                    }
+                Column {
+                    if (showManualEntry) {
+                        Text(
+                            "Manually add a package name if it's hidden from the list.",
+                            style = MaterialTheme.typography.bodySmall,
+                            modifier = Modifier.padding(bottom = 8.dp)
+                        )
+                        OutlinedTextField(
+                            value = manualPkg,
+                            onValueChange = { manualPkg = it },
+                            label = { Text("Package Name") },
+                            placeholder = { Text("e.g. com.revolut.revolut") },
+                            modifier = Modifier.fillMaxWidth(),
+                            singleLine = true
+                        )
+                        Spacer(modifier = Modifier.height(8.dp))
+                        Text("Target Space:", style = MaterialTheme.typography.labelMedium)
+                        
+                        val userManager = context.getSystemService(Context.USER_SERVICE) as UserManager
+                        userManager.userProfiles.forEach { profile ->
+                            val hash = userManager.getSerialNumberForUser(profile).toInt()
+                            val isMain = profile == android.os.Process.myUserHandle()
+                            Row(
+                                verticalAlignment = Alignment.CenterVertically,
+                                modifier = Modifier.fillMaxWidth().clickable { manualUserHash = hash }
+                            ) {
+                                RadioButton(selected = manualUserHash == hash, onClick = { manualUserHash = hash })
+                                Text(if (isMain) "Main Space" else "Private Space (User $hash)")
+                            }
+                        }
+                        
+                        Button(
+                            onClick = {
+                                if (manualPkg.isNotBlank()) {
+                                    val appKey = "${manualPkg.trim()}_$manualUserHash"
+                                    val newSelection = selectedPackageNames + appKey
                                     selectedPackageNames = newSelection
                                     sharedPrefs.edit().putStringSet("selected_apps", newSelection).apply()
+                                    manualPkg = ""
+                                    showSelector = false
                                 }
-                            )
-                            Text(text = app.name, modifier = Modifier.padding(start = 8.dp))
+                            },
+                            modifier = Modifier.fillMaxWidth().padding(top = 8.dp)
+                        ) {
+                            Text("Add Manually")
+                        }
+                    } else {
+                        LazyColumn(modifier = Modifier.height(400.dp)) {
+                            items(allInstalledApps, key = { "${it.packageName}_${it.userIdentifier}" }) { app ->
+                                val appKey = "${app.packageName}_${app.userIdentifier}"
+                                val isChecked = selectedPackageNames.contains(appKey)
+                                Row(
+                                    modifier = Modifier
+                                        .fillMaxWidth()
+                                        .padding(vertical = 8.dp),
+                                    verticalAlignment = Alignment.CenterVertically
+                                ) {
+                                    Checkbox(
+                                        checked = isChecked,
+                                        onCheckedChange = { checked ->
+                                            val newSelection = if (checked) {
+                                                selectedPackageNames + appKey
+                                            } else {
+                                                selectedPackageNames - appKey
+                                            }
+                                            selectedPackageNames = newSelection
+                                            sharedPrefs.edit().putStringSet("selected_apps", newSelection).apply()
+                                        }
+                                    )
+                                    Column(modifier = Modifier.padding(start = 8.dp)) {
+                                        Text(text = app.name)
+                                        if (app.isPrivateSpace) {
+                                            Text(
+                                                text = "Private Space (User ${app.userIdentifier})",
+                                                style = MaterialTheme.typography.labelSmall,
+                                                color = MaterialTheme.colorScheme.secondary
+                                            )
+                                        }
+                                    }
+                                }
+                            }
                         }
                     }
                 }
@@ -1638,8 +2039,11 @@ fun AppConfigItem(app: AppInfo, isChecked: Boolean, onCheckedChange: (Boolean) -
     val mappingsPrefs = remember { context.getSharedPreferences("iLogMappings", Context.MODE_PRIVATE) }
     val encryptedPrefs = remember { SecurityUtils.getEncryptedPrefs(context) }
     
+    // Use packageName as configuration key (sharing rules between spaces)
+    val configKey = app.packageName
+    
     // Load rules for this app
-    val rulesJson = sharedPrefs.getString(app.packageName, "[]") ?: "[]"
+    val rulesJson = sharedPrefs.getString(configKey, "[]") ?: "[]"
     val rules = remember(app.packageName) {
         try {
             Json.decodeFromString<List<ExtractionRule>>(rulesJson).toMutableStateList()
@@ -1710,7 +2114,16 @@ fun AppConfigItem(app: AppInfo, isChecked: Boolean, onCheckedChange: (Boolean) -
         Column(modifier = Modifier.padding(8.dp)) {
             Row(verticalAlignment = Alignment.CenterVertically) {
                 Checkbox(checked = isChecked, onCheckedChange = onCheckedChange)
-                Text(text = app.name, modifier = Modifier.weight(1f))
+                Column(modifier = Modifier.weight(1f)) {
+                    Text(text = app.name)
+                    if (app.isPrivateSpace) {
+                        Text(
+                            text = "Private Space",
+                            style = MaterialTheme.typography.labelSmall,
+                            color = MaterialTheme.colorScheme.secondary
+                        )
+                    }
+                }
                 IconButton(onClick = { expanded = !expanded }) {
                     Icon(
                         imageVector = if (expanded) Icons.Default.KeyboardArrowUp else Icons.Default.KeyboardArrowDown, 

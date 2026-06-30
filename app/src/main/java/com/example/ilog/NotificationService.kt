@@ -5,6 +5,7 @@ import android.app.NotificationManager
 import android.app.PendingIntent
 import android.content.Context
 import android.content.Intent
+import android.os.UserManager
 import android.service.notification.NotificationListenerService
 import android.service.notification.StatusBarNotification
 import android.util.Log
@@ -32,7 +33,9 @@ data class NotificationEntry(
     val title: String,
     val text: String,
     val postTime: Long,
-    val packageName: String = ""
+    val packageName: String = "",
+    val userIdentifier: Int = 0,
+    val isPrivateSpace: Boolean = false
 )
 
 class NotificationService : NotificationListenerService() {
@@ -53,9 +56,13 @@ class NotificationService : NotificationListenerService() {
         try {
             val sharedPrefs = getSharedPreferences("iLogPrefs", MODE_PRIVATE)
             val selectedApps = sharedPrefs.getStringSet("selected_apps", emptySet()) ?: emptySet()
+            val userManager = getSystemService(USER_SERVICE) as UserManager
             
             activeNotifications?.forEach { sbn ->
-                if (sbn.packageName in selectedApps) {
+                val userHash = userManager.getSerialNumberForUser(sbn.user).toInt()
+                val appKey = "${sbn.packageName}_$userHash"
+                
+                if (appKey in selectedApps) {
                     val extras = sbn.notification.extras
                     val title = (extras.getString("android.title") ?: "").replace("\n", " ")
                     val text = (extras.getCharSequence("android.text")?.toString() ?: "").replace("\n", " ")
@@ -117,13 +124,16 @@ class NotificationService : NotificationListenerService() {
 
     override fun onNotificationPosted(sbn: StatusBarNotification) {
         val packageName = sbn.packageName
+        val userManager = getSystemService(USER_SERVICE) as UserManager
+        val userHash = userManager.getSerialNumberForUser(sbn.user).toInt()
+        val appKey = "${packageName}_$userHash"
         
         val sharedPrefs = getSharedPreferences("iLogPrefs", MODE_PRIVATE)
         val selectedApps = sharedPrefs.getStringSet("selected_apps", emptySet()) ?: emptySet()
         
-        if (packageName !in selectedApps) return
+        if (appKey !in selectedApps) return
 
-        AppLog.d(this, TAG, "Notification received from: $packageName")
+        AppLog.d(this, TAG, "Notification received from: $appKey")
 
         if (!initSupabase()) return
 
