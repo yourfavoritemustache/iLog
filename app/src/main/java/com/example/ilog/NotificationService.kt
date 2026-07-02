@@ -1,15 +1,10 @@
 package com.example.ilog
 
-import android.app.NotificationChannel
-import android.app.NotificationManager
-import android.app.PendingIntent
-import android.content.Context
-import android.content.Intent
+import android.app.Notification
 import android.os.UserManager
 import android.service.notification.NotificationListenerService
 import android.service.notification.StatusBarNotification
-import android.util.Log
-import androidx.core.app.NotificationCompat
+import androidx.core.content.edit
 import io.github.jan.supabase.SupabaseClient
 import io.github.jan.supabase.createSupabaseClient
 import io.github.jan.supabase.postgrest.Postgrest
@@ -17,13 +12,10 @@ import io.github.jan.supabase.postgrest.from
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
-import kotlinx.coroutines.withContext
-import kotlinx.serialization.SerialName
 import kotlinx.serialization.Serializable
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.buildJsonObject
 import kotlinx.serialization.json.put
-import kotlinx.serialization.encodeToString
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
@@ -35,7 +27,7 @@ data class NotificationEntry(
     val postTime: Long,
     val packageName: String = "",
     val userIdentifier: Int = 0,
-    val isPrivateSpace: Boolean = false
+    val isPrivateSpace: Boolean = false,
 )
 
 class NotificationService : NotificationListenerService() {
@@ -50,7 +42,7 @@ class NotificationService : NotificationListenerService() {
     override fun onListenerConnected() {
         super.onListenerConnected()
         instance = this
-        AppLog.d(this, TAG, "Notification Listener Connected")
+        AppLog.d(this, tag, "Notification Listener Connected")
         
         // Backfill history with currently active notifications for selected apps
         try {
@@ -70,7 +62,7 @@ class NotificationService : NotificationListenerService() {
                 }
             }
         } catch (e: Exception) {
-            AppLog.e(this, TAG, "Failed to backfill history", e)
+            AppLog.e(this, tag, "Failed to backfill history", e)
         }
     }
 
@@ -86,7 +78,7 @@ class NotificationService : NotificationListenerService() {
     }
 
     private val scope = CoroutineScope(Dispatchers.IO)
-    private val TAG = "NotificationService"
+    private val tag = "NotificationService"
 
     private var supabaseUrl: String? = null
     private var supabaseKey: String? = null
@@ -100,11 +92,11 @@ class NotificationService : NotificationListenerService() {
         supabaseTable = prefs.getString("supabase_table", "transaction_fact_android") ?: "transaction_fact_android"
 
         if (url.isNullOrBlank() || key.isNullOrBlank()) {
-            AppLog.e(this, TAG, "Supabase URL or Key not configured")
+            AppLog.e(this, tag, "Supabase URL or Key not configured")
             return false
         }
 
-        if (supabase != null && url == supabaseUrl && key == supabaseKey) {
+        if ((supabase != null) && (url == supabaseUrl) && (key == supabaseKey)) {
             return true
         }
 
@@ -114,10 +106,10 @@ class NotificationService : NotificationListenerService() {
             supabase = createSupabaseClient(url, key) {
                 install(Postgrest)
             }
-            AppLog.d(this, TAG, "Supabase client initialized: $url")
+            AppLog.d(this, tag, "Supabase client initialized: $url")
             true
         } catch (e: Exception) {
-            AppLog.e(this, TAG, "Supabase initialization failed", e)
+            AppLog.e(this, tag, "Supabase initialization failed", e)
             false
         }
     }
@@ -133,19 +125,41 @@ class NotificationService : NotificationListenerService() {
         
         if (appKey !in selectedApps) return
 
-        AppLog.d(this, TAG, "Notification received from: $appKey")
+        AppLog.d(this, tag, "Notification received from: $appKey")
 
         if (!initSupabase()) return
 
         val extras = sbn.notification.extras
         val title = (extras.getString("android.title") ?: "").replace("\n", " ")
-        val text = (extras.getCharSequence("android.text")?.toString() ?: "").replace("\n", " ")
+        var text = (extras.getCharSequence("android.text")?.toString() ?: "").replace("\n", " ")
+        
+        // Fallback to bigText if text is empty
+        if (text.isBlank()) {
+            val bigText = extras.getCharSequence("android.bigText")?.toString() ?: ""
+            if (bigText.isNotBlank()) {
+                text = bigText.replace("\n", " ")
+            }
+        }
+
+        // Ignore empty notifications
+        if (title.isBlank() && text.isBlank()) {
+            AppLog.d(this, tag, "Skipping notification with empty title and text")
+            return
+        }
+
+        // Ignore group summaries and ongoing notifications that usually don't contain transaction data
+        val isGroupSummary = (sbn.notification.flags and Notification.FLAG_GROUP_SUMMARY) != 0
+        if (isGroupSummary) {
+            AppLog.d(this, tag, "Skipping group summary notification")
+            return
+        }
+
         val fullContent = "$title: $text"
         
-        getSharedPreferences("iLogExamples", MODE_PRIVATE).edit()
-            .putString("${packageName}_title", title)
-            .putString("${packageName}_text", text)
-            .apply()
+        getSharedPreferences("iLogExamples", MODE_PRIVATE).edit {
+            putString("${packageName}_title", title)
+            putString("${packageName}_text", text)
+        }
 
         val date = SimpleDateFormat("yyyy-MM-dd HH:mm:ss", Locale.getDefault()).format(Date(sbn.postTime))
         
@@ -153,7 +167,7 @@ class NotificationService : NotificationListenerService() {
             val pm = packageManager
             val ai = pm.getApplicationInfo(packageName, 0)
             pm.getApplicationLabel(ai).toString()
-        } catch (e: Exception) {
+        } catch (_: Exception) {
             packageName
         }
 
@@ -166,8 +180,8 @@ class NotificationService : NotificationListenerService() {
         val rules = try {
             Json.decodeFromString<List<ExtractionRule>>(rulesJson)
         } catch (e: Exception) {
-            AppLog.e(this, TAG, "Failed to parse rules for $packageName", e)
-            emptyList<ExtractionRule>()
+            AppLog.e(this, tag, "Failed to parse rules for $packageName", e)
+            emptyList()
         }
 
         val extractedData = mutableMapOf<String, String>()
@@ -209,7 +223,7 @@ class NotificationService : NotificationListenerService() {
                         extractedData[varName.lowercase()] = processedValue
                     }
                 } catch (e: Exception) {
-                    AppLog.e(this, TAG, "Extraction error for $varName", e)
+                    AppLog.e(this, tag, "Extraction error for $varName", e)
                 }
             }
         }
@@ -219,7 +233,7 @@ class NotificationService : NotificationListenerService() {
         val mappings = try {
             if (mappingsJson != null) Json.decodeFromString<List<BodyMapping>>(mappingsJson)
             else emptyList()
-        } catch (e: Exception) {
+        } catch (_: Exception) {
             emptyList()
         }
 
@@ -229,7 +243,7 @@ class NotificationService : NotificationListenerService() {
             "notification_raw" to fullContent,
             "app" to appName,
             "source" to appName,
-            "package" to packageName
+            "package" to packageName,
         )
         extractedData.forEach { (k, v) -> resolutionContext[k.lowercase()] = v }
 
@@ -265,12 +279,7 @@ class NotificationService : NotificationListenerService() {
                     }
 
                     if (isNumericField) {
-                        val parsed = parseAmount(resolvedValue)
-                        if (parsed != null) {
-                            put(key, parsed)
-                        } else {
-                            put(key, null as Double?)
-                        }
+                        put(key, parseAmount(resolvedValue))
                     } else {
                         // For non-explicitly numeric fields, try to see if it's a number anyway
                         // but only if it's a clean number (no extra text)
@@ -285,7 +294,7 @@ class NotificationService : NotificationListenerService() {
             }
         }
 
-        AppLog.d(this, TAG, "Attempting POST to $supabaseTable with body: $finalBody")
+        AppLog.d(this, tag, "Attempting POST to $supabaseTable with body: $finalBody")
 
         // Validation: Check if the body contains useful information
         val hasContent = if (mappings.isNotEmpty()) {
@@ -295,7 +304,7 @@ class NotificationService : NotificationListenerService() {
         }
 
         if (!hasContent) {
-            AppLog.e(this, TAG, "Extraction failed: All mapped fields are null")
+            AppLog.e(this, tag, "Extraction failed: All mapped fields are null")
             NotificationHelper.showErrorNotification(
                 this, title, text, 
                 "Extraction failed: Could not resolve any variables for the configured mappings."
@@ -307,11 +316,11 @@ class NotificationService : NotificationListenerService() {
             scope.launch {
                 try {
                     client.from(supabaseTable).insert(finalBody)
-                    AppLog.d(this@NotificationService, TAG, "Successfully sent to Supabase")
+                    AppLog.d(this@NotificationService, tag, "Successfully sent to Supabase")
                     NotificationHelper.showSuccessNotification(this@NotificationService, title, text)
                 } catch (e: Exception) {
                     val errorMsg = e.message ?: "Unknown error"
-                    AppLog.e(this@NotificationService, TAG, "Primary request failed: $errorMsg", e)
+                    AppLog.e(this@NotificationService, tag, "Primary request failed: $errorMsg", e)
                     
                     // Fallback: Try sending only notification info
                     try {
@@ -319,12 +328,12 @@ class NotificationService : NotificationListenerService() {
                             put("app_name", appName)
                             put("raw_notification", fullContent)
                         }
-                        AppLog.d(this@NotificationService, TAG, "Attempting clean fallback request")
+                        AppLog.d(this@NotificationService, tag, "Attempting clean fallback request")
                         client.from(supabaseTable).insert(fallbackBody)
-                        AppLog.d(this@NotificationService, TAG, "Fallback request successful")
+                        AppLog.d(this@NotificationService, tag, "Fallback request successful")
                         NotificationHelper.showSuccessNotification(this@NotificationService, title, text)
                     } catch (e2: Exception) {
-                        AppLog.e(this@NotificationService, TAG, "Fallback request also failed: ${e2.message}", e2)
+                        AppLog.e(this@NotificationService, tag, "Fallback request also failed: ${e2.message}", e2)
                         NotificationHelper.showErrorNotification(this@NotificationService, title, text, e2.message ?: "Unknown error")
                     }
                 }
@@ -349,12 +358,12 @@ class NotificationService : NotificationListenerService() {
             history.add(0, NotificationEntry(title, text, postTime, packageName))
             // Keep last 100 notifications per app
             val limitedHistory = if (history.size > 100) history.take(100) else history
-            historyPrefs.edit().putString(packageName, Json.encodeToString(limitedHistory)).apply()
+            historyPrefs.edit { putString(packageName, Json.encodeToString(limitedHistory)) }
         } catch (e: Exception) {
-            AppLog.e(this, TAG, "Failed to save history for $packageName", e)
+            AppLog.e(this, tag, "Failed to save history for $packageName", e)
             // If it failed to parse, start fresh
             val newHistory = listOf(NotificationEntry(title, text, postTime, packageName))
-            historyPrefs.edit().putString(packageName, Json.encodeToString(newHistory)).apply()
+            historyPrefs.edit { putString(packageName, Json.encodeToString(newHistory)) }
         }
     }
 }

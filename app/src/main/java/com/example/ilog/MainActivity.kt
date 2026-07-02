@@ -6,6 +6,7 @@ import android.content.Context
 import android.content.Intent
 import android.content.pm.LauncherApps
 import android.content.pm.PackageManager
+import android.content.pm.PermissionInfo
 import android.net.Uri
 import android.os.Build
 import android.os.Bundle
@@ -45,7 +46,6 @@ import androidx.compose.material.icons.filled.Delete
 import androidx.compose.material.icons.filled.ArrowDropDown
 import androidx.compose.material.icons.filled.Refresh
 import androidx.compose.material.icons.filled.Edit
-import androidx.compose.material.icons.filled.Info
 import androidx.compose.material.icons.filled.KeyboardArrowDown
 import androidx.compose.material.icons.filled.KeyboardArrowUp
 import androidx.compose.material.icons.filled.MoreVert
@@ -66,19 +66,18 @@ import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.OutlinedTextField
+import androidx.compose.material3.PrimaryScrollableTabRow
 import androidx.compose.material3.RadioButton
 import androidx.compose.material3.Scaffold
-import androidx.compose.material3.ScrollableTabRow
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Tab
-import androidx.compose.material3.TabRow
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
-import androidx.compose.material3.TextField
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateListOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
@@ -89,12 +88,13 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.LocalContext
-import androidx.compose.ui.platform.LocalLifecycleOwner
 import androidx.compose.ui.text.input.PasswordVisualTransformation
 import androidx.compose.ui.unit.dp
 import androidx.core.content.ContextCompat
+import androidx.core.content.edit
 import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.LifecycleEventObserver
+import androidx.lifecycle.compose.LocalLifecycleOwner
 import com.example.ilog.ui.theme.ILogTheme
 import io.github.jan.supabase.createSupabaseClient
 import io.github.jan.supabase.postgrest.Postgrest
@@ -103,13 +103,11 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import kotlinx.serialization.Serializable
-import kotlinx.serialization.encodeToString
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.buildJsonObject
 import kotlinx.serialization.json.put
 import kotlinx.serialization.json.jsonObject
-import kotlinx.serialization.json.jsonArray
 import java.net.URL
 import java.text.SimpleDateFormat
 import java.util.Date
@@ -123,13 +121,13 @@ data class ExtractionRule(
     val source: String = "Text", // "Title", "Text", or "Fixed Value"
     val matchType: String = "Group 1", // "First Match", "Group 1", "Full Match"
     val fixedValue: String = "",
-    val dataType: String = "String" // "String", "Number", "Decimal", "Boolean"
+    val dataType: String = "String", // "String", "Number", "Decimal", "Boolean"
 )
 
 @Serializable
 data class BodyMapping(
     val key: String,
-    val valueTemplate: String
+    val valueTemplate: String,
 )
 
 @Serializable
@@ -163,16 +161,16 @@ fun MainContainer() {
     // Migrate old selected_apps format to new pkg_userHash format
     LaunchedEffect(Unit) {
         val current = sharedPrefs.getStringSet("selected_apps", emptySet()) ?: emptySet()
-        val migrated = current.map { key ->
-            if (!key.contains("_")) "${key}_0" else key
-        }.toSet()
+                    val migrated = current.map { key ->
+                        if (!key.contains("_")) "${key}_0" else key
+                    }.toSet()
         if (migrated != current) {
-            sharedPrefs.edit().putStringSet("selected_apps", migrated).apply()
+            sharedPrefs.edit { putStringSet("selected_apps", migrated) }
         }
     }
 
     val tabs = listOf("Home", "Database", "App Config", "Test Send", "History", "Debug Logs")
-    val pagerState = rememberPagerState(pageCount = { tabs.size })
+    val pagerState = rememberPagerState { tabs.size }
     val scope = rememberCoroutineScope()
 
     Scaffold(
@@ -180,7 +178,7 @@ fun MainContainer() {
         topBar = {
             Column {
                 Spacer(modifier = Modifier.height(32.dp))
-                ScrollableTabRow(
+                PrimaryScrollableTabRow(
                     selectedTabIndex = pagerState.currentPage,
                     edgePadding = 16.dp
                 ) {
@@ -475,19 +473,24 @@ fun isHibernationDisabled(context: Context): Boolean {
 fun hasDangerousPermissions(context: Context): Boolean {
     return try {
         val pm = context.packageManager
-        val info = pm.getPackageInfo(context.packageName, android.content.pm.PackageManager.GET_PERMISSIONS)
+        val info = pm.getPackageInfo(context.packageName, PackageManager.GET_PERMISSIONS)
         val requestedPermissions = info.requestedPermissions ?: return false
 
         requestedPermissions.any { permission ->
             try {
                 val pInfo = pm.getPermissionInfo(permission, 0)
-                (pInfo.protectionLevel and android.content.pm.PermissionInfo.PROTECTION_MASK_BASE) ==
-                        android.content.pm.PermissionInfo.PROTECTION_DANGEROUS
-            } catch (e: Exception) {
+                val protection = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
+                    pInfo.protection
+                } else {
+                    @Suppress("DEPRECATION")
+                    pInfo.protectionLevel and PermissionInfo.PROTECTION_MASK_BASE
+                }
+                protection == PermissionInfo.PROTECTION_DANGEROUS
+            } catch (_: Exception) {
                 false
             }
         }
-    } catch (e: Exception) {
+    } catch (_: Exception) {
         false
     }
 }
@@ -505,7 +508,6 @@ fun DatabaseConfigScreen() {
 fun BackupRestoreSection() {
     val context = LocalContext.current
     val scope = rememberCoroutineScope()
-    val encryptedPrefs = remember { SecurityUtils.getEncryptedPrefs(context) }
     
     var backupKey by remember { mutableStateOf("") }
     var statusMessage by remember { mutableStateOf("") }
@@ -661,19 +663,23 @@ private suspend fun performRestore(context: Context, key: String): String {
         val rulesPrefs = context.getSharedPreferences("iLogRules", Context.MODE_PRIVATE)
         val mappingsPrefs = context.getSharedPreferences("iLogMappings", Context.MODE_PRIVATE)
 
-        iLogPrefs.edit().putStringSet("selected_apps", payload.selectedApps.toSet()).apply()
+        iLogPrefs.edit { putStringSet("selected_apps", payload.selectedApps.toSet()) }
         
-        rulesPrefs.edit().clear().apply()
-        payload.rules.forEach { (k, v) -> rulesPrefs.edit().putString(k, v).apply() }
+        rulesPrefs.edit {
+            clear()
+            payload.rules.forEach { (k, v) -> putString(k, v) }
+        }
         
-        mappingsPrefs.edit().clear().apply()
-        payload.mappings.forEach { (k, v) -> mappingsPrefs.edit().putString(k, v).apply() }
+        mappingsPrefs.edit {
+            clear()
+            payload.mappings.forEach { (k, v) -> putString(k, v) }
+        }
 
-        encryptedPrefs.edit()
-            .putString("supabase_url", payload.supabaseUrl)
-            .putString("supabase_table", payload.supabaseTable)
-            .putString("supabase_key", payload.supabaseKey)
-            .apply()
+        encryptedPrefs.edit {
+            putString("supabase_url", payload.supabaseUrl)
+            putString("supabase_table", payload.supabaseTable)
+            putString("supabase_key", payload.supabaseKey)
+        }
 
         "Success: Settings restored! Please restart the app for all changes to take effect."
     } catch (e: Exception) {
@@ -710,9 +716,9 @@ fun SupabaseConfigSection() {
                         
                         // Save columns to prefs for use in AppConfig
                         val columnsJson = Json.encodeToString(tableColumns)
-                        encryptedPrefs.edit().putString("supabase_columns", columnsJson).apply()
+                        encryptedPrefs.edit { putString("supabase_columns", columnsJson) }
                     }
-                } catch (e: Exception) {
+                } catch (_: Exception) {
                     withContext(Dispatchers.Main) {
                         isLoadingTables = false
                     }
@@ -796,11 +802,11 @@ fun SupabaseConfigSection() {
             
             Button(
                 onClick = {
-                    encryptedPrefs.edit()
-                        .putString("supabase_url", url)
-                        .putString("supabase_key", key)
-                        .putString("supabase_table", tableName)
-                        .apply()
+                    encryptedPrefs.edit {
+                        putString("supabase_url", url)
+                        putString("supabase_key", key)
+                        putString("supabase_table", tableName)
+                    }
                     saved = true
                 },
                 modifier = Modifier.fillMaxWidth()
@@ -909,14 +915,14 @@ fun TestSendScreen() {
                             try {
                                 val method = UserManager::class.java.getMethod("isPrivateProfile")
                                 method.invoke(userManager) as Boolean
-                            } catch (e: Exception) { false }
+                            } catch (_: Exception) { false }
                         } else user != android.os.Process.myUserHandle()
 
                         AppInfo(name, pkg, isPrivate, userHash)
                     } else {
                         AppInfo(pkg, pkg, userHash != 0, userHash)
                     }
-                } catch (e: Exception) {
+                } catch (_: Exception) {
                     AppInfo(pkg, pkg, userHash != 0, userHash)
                 }
             }.distinctBy { "${it.packageName}_${it.userIdentifier}" }.sortedBy { it.name }
@@ -1137,14 +1143,14 @@ private suspend fun performTestSend(
                     // Identify if this was a direct numeric variable like {amount}
                     val isDirectVar = mapping.valueTemplate.startsWith("{") && mapping.valueTemplate.endsWith("}")
                     val varName = if (isDirectVar) mapping.valueTemplate.substring(1, mapping.valueTemplate.length - 1).lowercase() else ""
-                    val isNumericVar = varName == "amount" || varName.contains("price") || varName.contains("total")
+                    val isNumericVar = (varName == "amount") || varName.contains("price") || varName.contains("total")
 
                     if (isDirectVar && isNumericVar) {
                         val parsed = parseAmount(resolvedValue)
                         if (parsed != null) put(mapping.key, parsed) else put(mapping.key, null as Double?)
                     } else {
                         val numericValue = resolvedValue.toDoubleOrNull()
-                        if (numericValue != null && !mapping.valueTemplate.contains("{")) {
+                        if ((numericValue != null) && !mapping.valueTemplate.contains("{")) {
                             put(mapping.key, numericValue)
                         } else {
                             put(mapping.key, resolvedValue)
@@ -1186,7 +1192,6 @@ fun NotificationHistoryScreen() {
     val context = LocalContext.current
     val sharedPrefs = remember { context.getSharedPreferences("iLogPrefs", Context.MODE_PRIVATE) }
     val historyPrefs = remember { context.getSharedPreferences("iLogHistory", Context.MODE_PRIVATE) }
-    val scope = rememberCoroutineScope()
 
     val lifecycleOwner = LocalLifecycleOwner.current
     var selectedPackageNames by remember {
@@ -1230,14 +1235,14 @@ fun NotificationHistoryScreen() {
                             try {
                                 val method = UserManager::class.java.getMethod("isPrivateProfile")
                                 method.invoke(userManager) as Boolean
-                            } catch (e: Exception) { false }
+                            } catch (_: Exception) { false }
                         } else user != android.os.Process.myUserHandle()
 
                         AppInfo(name, pkg, isPrivate, userHash)
                     } else {
                         AppInfo(pkg, pkg, userHash != 0, userHash)
                     }
-                } catch (e: Exception) {
+                } catch (_: Exception) {
                     AppInfo(pkg, pkg, userHash != 0, userHash)
                 }
             }.distinctBy { "${it.packageName}_${it.userIdentifier}" }.sortedBy { it.name }
@@ -1263,7 +1268,7 @@ fun NotificationHistoryScreen() {
             val json = historyPrefs.getString(app.packageName, "[]") ?: "[]"
             historyList = try {
                 Json.decodeFromString<List<NotificationEntry>>(json)
-            } catch (e: Exception) {
+            } catch (_: Exception) {
                 emptyList()
             }
         } else {
@@ -1276,7 +1281,7 @@ fun NotificationHistoryScreen() {
                     val json = historyPrefs.getString(pkg, "[]") ?: "[]"
                     try {
                         allHistory.addAll(Json.decodeFromString<List<NotificationEntry>>(json))
-                    } catch (e: Exception) {}
+                    } catch (_: Exception) {}
                     processedPackages.add(pkg)
                 }
             }
@@ -1297,7 +1302,7 @@ fun NotificationHistoryScreen() {
                 try {
                     val method = UserManager::class.java.getMethod("isPrivateProfile")
                     isPrivate = method.invoke(userManager) as Boolean
-                } catch (e: Exception) {}
+                } catch (_: Exception) {}
             }
             if (!isPrivate && userHash != 0) isPrivate = true
 
@@ -1461,7 +1466,7 @@ fun NotificationHistoryScreen() {
                 Button(
                     onClick = {
                         selectedApp?.let { app ->
-                            historyPrefs.edit().remove(app.packageName).apply()
+                            historyPrefs.edit { remove(app.packageName) }
                             refreshHistory()
                         }
                     },
@@ -1540,10 +1545,10 @@ fun NotificationHistoryItem(entry: NotificationEntry, isHistory: Boolean) {
             ) {
                 TextButton(onClick = {
                     val examplesPrefs = context.getSharedPreferences("iLogExamples", Context.MODE_PRIVATE)
-                    examplesPrefs.edit()
-                        .putString("${entry.packageName}_title", entry.title)
-                        .putString("${entry.packageName}_text", entry.text)
-                        .apply()
+                    examplesPrefs.edit {
+                        putString("${entry.packageName}_title", entry.title)
+                        putString("${entry.packageName}_text", entry.text)
+                    }
                 }) {
                     Text("Use as Example", style = MaterialTheme.typography.labelMedium)
                 }
@@ -1636,40 +1641,6 @@ fun DebugLogsScreen() {
     }
 }
 
-@Composable
-fun NotificationStatusHeader(isEnabled: Boolean) {
-    Card(
-        modifier = Modifier.fillMaxWidth(),
-        colors = CardDefaults.cardColors(
-            containerColor = if (isEnabled) 
-                MaterialTheme.colorScheme.primaryContainer 
-            else MaterialTheme.colorScheme.errorContainer
-        )
-    ) {
-        Row(
-            modifier = Modifier.padding(16.dp),
-            verticalAlignment = Alignment.CenterVertically
-        ) {
-            Icon(
-                imageVector = if (isEnabled) Icons.Default.Info else Icons.Default.Settings,
-                contentDescription = null
-            )
-            Spacer(modifier = Modifier.width(12.dp))
-            Column {
-                Text(
-                    text = if (isEnabled) "Service is Running" else "Service is Disabled",
-                    style = MaterialTheme.typography.titleMedium
-                )
-                Text(
-                    text = if (isEnabled) 
-                        "iLog is actively monitoring notifications." 
-                    else "Click to enable notification access.",
-                    style = MaterialTheme.typography.bodySmall
-                )
-            }
-        }
-    }
-}
 
 data class AppInfo(
     val name: String, 
@@ -1718,7 +1689,7 @@ fun AppConfigScreen() {
     
     var allInstalledApps by remember { mutableStateOf<List<AppInfo>>(emptyList()) }
     var isLoadingApps by remember { mutableStateOf(true) }
-    var refreshTrigger by remember { mutableStateOf(0) }
+    var refreshTrigger by remember { mutableIntStateOf(0) }
 
     LaunchedEffect(refreshTrigger) {
         isLoadingApps = true
@@ -1743,7 +1714,7 @@ fun AppConfigScreen() {
                 val isMainUser = user == myUserHandle
                 val userHash = userManager.getSerialNumberForUser(user).toInt()
                 
-                val isQuiet = try { userManager.isQuietModeEnabled(user) } catch (e: Exception) { false }
+                val isQuiet = try { userManager.isQuietModeEnabled(user) } catch (_: Exception) { false }
 
                 AppLog.d(context, "AppConfig", "Processing profile: $userHash (Main: $isMainUser, Quiet: $isQuiet)")
 
@@ -1753,7 +1724,7 @@ fun AppConfigScreen() {
                     try {
                         val method = UserManager::class.java.getMethod("isPrivateProfile")
                         isPrivate = method.invoke(userManager) as Boolean
-                    } catch (e: Exception) {}
+                    } catch (_: Exception) {}
                 }
                 
                 val isSecondarySpace = !isMainUser
@@ -1799,7 +1770,7 @@ fun AppConfigScreen() {
                                 val appInfo = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
                                     try {
                                         launcherApps.getApplicationInfo(pkg, 0, user)
-                                    } catch (e: Exception) { null }
+                                    } catch (_: Exception) { null }
                                 } else null
 
                                 if (appInfo != null || launcherApps.isPackageEnabled(pkg, user)) {
@@ -1822,7 +1793,7 @@ fun AppConfigScreen() {
                                         userIdentifier = userHash
                                     ))
                                 }
-                            } catch (e: Exception) {}
+                            } catch (_: Exception) {}
                         }
                     }
                 } catch (e: Exception) {
@@ -1911,7 +1882,7 @@ fun AppConfigScreen() {
                 val appKey = "${app.packageName}_${app.userIdentifier}"
                 val newSelection = selectedPackageNames - appKey
                 selectedPackageNames = newSelection
-                sharedPrefs.edit().putStringSet("selected_apps", newSelection).apply()
+                sharedPrefs.edit { putStringSet("selected_apps", newSelection) }
             },
             onDismiss = { appToDelete = null }
         )
@@ -1919,7 +1890,7 @@ fun AppConfigScreen() {
 
     if (showSelector) {
         var manualPkg by remember { mutableStateOf("") }
-        var manualUserHash by remember { mutableStateOf(0) }
+        var manualUserHash by remember { mutableIntStateOf(0) }
         var showManualEntry by remember { mutableStateOf(false) }
 
         AlertDialog(
@@ -1974,7 +1945,7 @@ fun AppConfigScreen() {
                                     val appKey = "${manualPkg.trim()}_$manualUserHash"
                                     val newSelection = selectedPackageNames + appKey
                                     selectedPackageNames = newSelection
-                                    sharedPrefs.edit().putStringSet("selected_apps", newSelection).apply()
+                                    sharedPrefs.edit { putStringSet("selected_apps", newSelection) }
                                     manualPkg = ""
                                     showSelector = false
                                 }
@@ -2003,7 +1974,7 @@ fun AppConfigScreen() {
                                                 selectedPackageNames - appKey
                                             }
                                             selectedPackageNames = newSelection
-                                            sharedPrefs.edit().putStringSet("selected_apps", newSelection).apply()
+                                            sharedPrefs.edit { putStringSet("selected_apps", newSelection) }
                                         }
                                     )
                                     Column(modifier = Modifier.padding(start = 8.dp)) {
@@ -2047,8 +2018,8 @@ fun AppConfigItem(app: AppInfo, isChecked: Boolean, onCheckedChange: (Boolean) -
     val rules = remember(app.packageName) {
         try {
             Json.decodeFromString<List<ExtractionRule>>(rulesJson).toMutableStateList()
-        } catch (e: Exception) {
-            mutableStateListOf<ExtractionRule>()
+        } catch (_: Exception) {
+            mutableStateListOf()
         }
     }
     
@@ -2057,8 +2028,8 @@ fun AppConfigItem(app: AppInfo, isChecked: Boolean, onCheckedChange: (Boolean) -
     val mappings = remember(app.packageName) {
         try {
             Json.decodeFromString<List<BodyMapping>>(mappingsJson).toMutableStateList()
-        } catch (e: Exception) {
-            mutableStateListOf<BodyMapping>()
+        } catch (_: Exception) {
+            mutableStateListOf()
         }
     }
 
@@ -2069,7 +2040,7 @@ fun AppConfigItem(app: AppInfo, isChecked: Boolean, onCheckedChange: (Boolean) -
         try {
             val map = Json.decodeFromString<Map<String, List<String>>>(allColumnsJson)
             map[targetTable] ?: emptyList()
-        } catch (e: Exception) {
+        } catch (_: Exception) {
             emptyList()
         }
     }
@@ -2352,13 +2323,13 @@ fun AppConfigItem(app: AppInfo, isChecked: Boolean, onCheckedChange: (Boolean) -
 private fun saveRules(context: Context, packageName: String, rules: List<ExtractionRule>) {
     val sharedPrefs = context.getSharedPreferences("iLogRules", Context.MODE_PRIVATE)
     val json = Json.encodeToString(rules)
-    sharedPrefs.edit().putString(packageName, json).apply()
+    sharedPrefs.edit { putString(packageName, json) }
 }
 
 private fun saveMappings(context: Context, packageName: String, mappings: List<BodyMapping>) {
     val sharedPrefs = context.getSharedPreferences("iLogMappings", Context.MODE_PRIVATE)
     val json = Json.encodeToString(mappings)
-    sharedPrefs.edit().putString(packageName, json).apply()
+    sharedPrefs.edit { putString(packageName, json) }
 }
 
 @Composable
@@ -2679,7 +2650,7 @@ fun ExtractionRuleEditorDialog(
                             "Full Match" -> if (r.matches(contentToProcess)) contentToProcess else null
                             else -> null
                         }
-                    } catch (e: Exception) {
+                    } catch (_: Exception) {
                         null
                     }
                 }
