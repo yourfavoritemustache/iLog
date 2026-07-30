@@ -9,6 +9,9 @@ import io.github.jan.supabase.SupabaseClient
 import io.github.jan.supabase.createSupabaseClient
 import io.github.jan.supabase.postgrest.Postgrest
 import io.github.jan.supabase.postgrest.from
+import com.google.android.gms.location.LocationServices
+import com.google.android.gms.location.Priority
+import com.google.android.gms.tasks.Tasks
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
@@ -19,6 +22,7 @@ import kotlinx.serialization.json.put
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
+import java.util.concurrent.TimeUnit
 
 @Serializable
 data class NotificationEntry(
@@ -184,136 +188,168 @@ class NotificationService : NotificationListenerService() {
             emptyList()
         }
 
-        val extractedData = mutableMapOf<String, String>()
-        rules.forEach { rule ->
-            val varName = rule.varName.trim()
-            if (varName.isNotBlank()) {
+        scope.launch {
+            // Capture location
+            var locationString: String? = null
+            val hasFine = androidx.core.content.ContextCompat.checkSelfPermission(this@NotificationService, android.Manifest.permission.ACCESS_FINE_LOCATION) == android.content.pm.PackageManager.PERMISSION_GRANTED
+            val hasCoarse = androidx.core.content.ContextCompat.checkSelfPermission(this@NotificationService, android.Manifest.permission.ACCESS_COARSE_LOCATION) == android.content.pm.PackageManager.PERMISSION_GRANTED
+            
+            if (hasFine || hasCoarse) {
                 try {
-                    val value = if (rule.source == "Fixed Value") {
-                        rule.fixedValue
-                    } else {
-                        val contentToProcess = rule.source
-                            .replace("{title}", title, ignoreCase = true)
-                            .replace("{text}", text, ignoreCase = true)
-                            .let { 
-                                if (it.equals("Title", ignoreCase = true)) title 
-                                else if (it.equals("Text", ignoreCase = true)) text 
-                                else it 
-                            }
-
-                        if (rule.regex.isBlank()) {
-                            contentToProcess
-                        } else {
-                            val regex = Regex(rule.regex, RegexOption.IGNORE_CASE)
-                            when (rule.matchType) {
-                                "Group 1" -> regex.find(contentToProcess)?.groupValues?.getOrNull(1)
-                                "Full Match" -> if (regex.matches(contentToProcess)) contentToProcess else null
-                                "First Match" -> regex.find(contentToProcess)?.value
-                                else -> regex.find(contentToProcess)?.value
-                            }
-                        }
-                    }
+                    val fusedLocationClient = LocationServices.getFusedLocationProviderClient(this@NotificationService)
+                    var location = Tasks.await(fusedLocationClient.lastLocation, 1, TimeUnit.SECONDS)
                     
-                    if (value != null) {
-                        val processedValue = if (rule.dataType == "Number" || rule.dataType == "Decimal") {
-                            parseAmount(value)?.toString() ?: value
-                        } else {
-                            value
-                        }
-                        extractedData[varName.lowercase()] = processedValue
+                    if (location == null) {
+                        AppLog.d(this@NotificationService, tag, "Last location null, requesting fresh location...")
+                        location = Tasks.await(
+                            fusedLocationClient.getCurrentLocation(Priority.PRIORITY_BALANCED_POWER_ACCURACY, null),
+                            3, TimeUnit.SECONDS
+                        )
+                    }
+
+                    if (location != null) {
+                        // PostGIS geography(POINT, 4326) format: SRID=4326;POINT(${location.longitude} ${location.latitude})
+                        locationString = "SRID=4326;POINT(${location.longitude} ${location.latitude})"
+                        AppLog.d(this@NotificationService, tag, "Captured location: $locationString")
+                    } else {
+                        AppLog.d(this@NotificationService, tag, "Location is still null after fresh request")
                     }
                 } catch (e: Exception) {
-                    AppLog.e(this, tag, "Extraction error for $varName", e)
+                    AppLog.e(this@NotificationService, tag, "Location capture failed: ${e.message}")
                 }
             }
-        }
 
-        val mappingsPrefs = getSharedPreferences("iLogMappings", MODE_PRIVATE)
-        val mappingsJson = mappingsPrefs.getString(packageName, null)
-        val mappings = try {
-            if (mappingsJson != null) Json.decodeFromString<List<BodyMapping>>(mappingsJson)
-            else emptyList()
-        } catch (_: Exception) {
-            emptyList()
-        }
-
-        val resolutionContext = mutableMapOf(
-            "date" to date,
-            "raw" to fullContent,
-            "notification_raw" to fullContent,
-            "app" to appName,
-            "source" to appName,
-            "package" to packageName,
-        )
-        extractedData.forEach { (k, v) -> resolutionContext[k.lowercase()] = v }
-
-        val finalBody = buildJsonObject {
-            if (mappings.isEmpty()) {
-                put("app_name", appName)
-                put("raw_notification", fullContent)
-            } else {
-                mappings.forEach { mapping ->
-                    val key = mapping.key
-                    if (key.isBlank()) return@forEach
-
-                    var resolvedValue = mapping.valueTemplate
-                    resolutionContext.forEach { (name, value) ->
-                        resolvedValue = resolvedValue.replace("{$name}", value, ignoreCase = true)
-                    }
-                    
-                    // Identify if this is intended to be a numeric field based on key name or template
-                    val isNumericField = key.lowercase().let {
-                        it == "amount" || it.contains("price") || it.contains("total") || it.contains("value")
-                    } || mapping.valueTemplate.lowercase().let {
-                        it.contains("amount") || it.contains("price") || it.contains("total")
-                    }
-
-                    // If it still contains placeholders, it failed to resolve
-                    if (resolvedValue.contains("{") || resolvedValue.contains("}")) {
-                        if (isNumericField) {
-                            put(key, null as Double?)
+            val extractedData = mutableMapOf<String, String>()
+            rules.forEach { rule ->
+                val varName = rule.varName.trim()
+                if (varName.isNotBlank()) {
+                    try {
+                        val value = if (rule.source == "Fixed Value") {
+                            rule.fixedValue
                         } else {
-                            put(key, null as String?)
-                        }
-                        return@forEach
-                    }
+                            val contentToProcess = rule.source
+                                .replace("{title}", title, ignoreCase = true)
+                                .replace("{text}", text, ignoreCase = true)
+                                .let { 
+                                    if (it.equals("Title", ignoreCase = true)) title 
+                                    else if (it.equals("Text", ignoreCase = true)) text 
+                                    else it 
+                                }
 
-                    if (isNumericField) {
-                        put(key, parseAmount(resolvedValue))
-                    } else {
-                        // For non-explicitly numeric fields, try to see if it's a number anyway
-                        // but only if it's a clean number (no extra text)
-                        val numericValue = resolvedValue.toDoubleOrNull()
-                        if (numericValue != null && !mapping.valueTemplate.contains("{")) {
-                            put(key, numericValue)
-                        } else {
-                            put(key, resolvedValue)
+                            if (rule.regex.isBlank()) {
+                                contentToProcess
+                            } else {
+                                val regex = Regex(rule.regex, RegexOption.IGNORE_CASE)
+                                when (rule.matchType) {
+                                    "Group 1" -> regex.find(contentToProcess)?.groupValues?.getOrNull(1)
+                                    "Full Match" -> if (regex.matches(contentToProcess)) contentToProcess else null
+                                    "First Match" -> regex.find(contentToProcess)?.value
+                                    else -> regex.find(contentToProcess)?.value
+                                }
+                            }
                         }
+                        
+                        if (value != null) {
+                            val processedValue = if (rule.dataType == "Number" || rule.dataType == "Decimal") {
+                                parseAmount(value)?.toString() ?: value
+                            } else {
+                                value
+                            }
+                            extractedData[varName.lowercase()] = processedValue
+                        }
+                    } catch (e: Exception) {
+                        AppLog.e(this@NotificationService, tag, "Extraction error for $varName", e)
                     }
                 }
             }
-        }
 
-        AppLog.d(this, tag, "Attempting POST to $supabaseTable with body: $finalBody")
+            val mappingsPrefs = getSharedPreferences("iLogMappings", MODE_PRIVATE)
+            val mappingsJson = mappingsPrefs.getString(packageName, null)
+            val mappings = try {
+                if (mappingsJson != null) Json.decodeFromString<List<BodyMapping>>(mappingsJson)
+                else emptyList()
+            } catch (_: Exception) {
+                emptyList()
+            }
 
-        // Validation: Check if the body contains useful information
-        val hasContent = if (mappings.isNotEmpty()) {
-            finalBody.values.any { it !is kotlinx.serialization.json.JsonNull }
-        } else {
-            true // Default app_name/raw_notification always present
-        }
-
-        if (!hasContent) {
-            AppLog.e(this, tag, "Extraction failed: All mapped fields are null")
-            NotificationHelper.showErrorNotification(
-                this, title, text, 
-                "Extraction failed: Could not resolve any variables for the configured mappings."
+            val resolutionContext = mutableMapOf(
+                "date" to date,
+                "raw" to fullContent,
+                "notification_raw" to fullContent,
+                "app" to appName,
+                "source" to appName,
+                "package" to packageName,
+                "location" to (locationString ?: ""),
             )
-            return
-        }
+            extractedData.forEach { (k, v) -> resolutionContext[k.lowercase()] = v }
 
-        supabase?.let { client ->
-            scope.launch {
+            val finalBody = buildJsonObject {
+                if (mappings.isEmpty()) {
+                    put("app_name", appName)
+                    put("raw_notification", fullContent)
+                    if (locationString != null) put("location", locationString)
+                } else {
+                    mappings.forEach { mapping ->
+                        val key = mapping.key
+                        if (key.isBlank()) return@forEach
+
+                        var resolvedValue = mapping.valueTemplate
+                        resolutionContext.forEach { (name, value) ->
+                            resolvedValue = resolvedValue.replace("{$name}", value, ignoreCase = true)
+                        }
+                        
+                        // Identify if this is intended to be a numeric field based on key name or template
+                        val isNumericField = key.lowercase().let {
+                            it == "amount" || it.contains("price") || it.contains("total") || it.contains("value")
+                        } || mapping.valueTemplate.lowercase().let {
+                            it.contains("amount") || it.contains("price") || it.contains("total")
+                        }
+
+                        // If it still contains placeholders, it failed to resolve
+                        if (resolvedValue.contains("{") || resolvedValue.contains("}")) {
+                            if (isNumericField) {
+                                put(key, null as Double?)
+                            } else {
+                                put(key, null as String?)
+                            }
+                            return@forEach
+                        }
+
+                        if (isNumericField) {
+                            put(key, parseAmount(resolvedValue))
+                        } else {
+                            // For non-explicitly numeric fields, try to see if it's a number anyway
+                            // but only if it's a clean number (no extra text)
+                            val numericValue = resolvedValue.toDoubleOrNull()
+                            if (numericValue != null && !mapping.valueTemplate.contains("{")) {
+                                put(key, numericValue)
+                            } else {
+                                put(key, resolvedValue)
+                            }
+                        }
+                    }
+                }
+            }
+
+            AppLog.d(this@NotificationService, tag, "Attempting POST to $supabaseTable with body: $finalBody")
+
+            // Validation: Check if the body contains useful information
+            val hasContent = if (mappings.isNotEmpty()) {
+                finalBody.values.any { it !is kotlinx.serialization.json.JsonNull }
+            } else {
+                true // Default app_name/raw_notification always present
+            }
+
+            if (!hasContent) {
+                AppLog.e(this@NotificationService, tag, "Extraction failed: All mapped fields are null")
+                NotificationHelper.showErrorNotification(
+                    this@NotificationService, title, text, 
+                    "Extraction failed: Could not resolve any variables for the configured mappings."
+                )
+                return@launch
+            }
+
+            supabase?.let { client ->
                 try {
                     client.from(supabaseTable).insert(finalBody)
                     AppLog.d(this@NotificationService, tag, "Successfully sent to Supabase")
@@ -327,6 +363,7 @@ class NotificationService : NotificationListenerService() {
                         val fallbackBody = buildJsonObject {
                             put("app_name", appName)
                             put("raw_notification", fullContent)
+                            if (locationString != null) put("location", locationString)
                         }
                         AppLog.d(this@NotificationService, tag, "Attempting clean fallback request")
                         client.from(supabaseTable).insert(fallbackBody)

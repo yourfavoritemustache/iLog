@@ -92,6 +92,9 @@ import androidx.compose.ui.text.input.PasswordVisualTransformation
 import androidx.compose.ui.unit.dp
 import androidx.core.content.ContextCompat
 import androidx.core.content.edit
+import com.google.android.gms.location.LocationServices
+import com.google.android.gms.location.Priority
+import com.google.android.gms.tasks.Tasks
 import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.LifecycleEventObserver
 import androidx.lifecycle.compose.LocalLifecycleOwner
@@ -112,6 +115,7 @@ import java.net.URL
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
+import java.util.concurrent.TimeUnit
 import javax.net.ssl.HttpsURLConnection
 
 @Serializable
@@ -233,14 +237,27 @@ fun HomeScreen() {
     }
     var isBatteryOptimized by remember { mutableStateOf(isBatteryOptimized(context)) }
     var isHibernationDisabled by remember { mutableStateOf(isHibernationDisabled(context)) }
+    var isLocationGranted by remember {
+        mutableStateOf(
+            ContextCompat.checkSelfPermission(context, Manifest.permission.ACCESS_FINE_LOCATION) == PackageManager.PERMISSION_GRANTED ||
+            ContextCompat.checkSelfPermission(context, Manifest.permission.ACCESS_COARSE_LOCATION) == PackageManager.PERMISSION_GRANTED
+        )
+    }
     var showPermissionDialog by remember { mutableStateOf(false) }
 
-    val allSystemsGo = isPermissionEnabled && isPostNotificationGranted && !isBatteryOptimized && isHibernationDisabled
+    val allSystemsGo = isPermissionEnabled && isPostNotificationGranted && isLocationGranted && !isBatteryOptimized && isHibernationDisabled
 
     val permissionLauncher = rememberLauncherForActivityResult(
         ActivityResultContracts.RequestPermission()
     ) { isGranted ->
         isPostNotificationGranted = isGranted
+    }
+
+    val locationLauncher = rememberLauncherForActivityResult(
+        ActivityResultContracts.RequestMultiplePermissions()
+    ) { permissions ->
+        isLocationGranted = permissions[Manifest.permission.ACCESS_FINE_LOCATION] == true ||
+                            permissions[Manifest.permission.ACCESS_COARSE_LOCATION] == true
     }
 
     DisposableEffect(lifecycleOwner) {
@@ -252,6 +269,8 @@ fun HomeScreen() {
                 }
                 isBatteryOptimized = isBatteryOptimized(context)
                 isHibernationDisabled = isHibernationDisabled(context)
+                isLocationGranted = ContextCompat.checkSelfPermission(context, Manifest.permission.ACCESS_FINE_LOCATION) == PackageManager.PERMISSION_GRANTED ||
+                                   ContextCompat.checkSelfPermission(context, Manifest.permission.ACCESS_COARSE_LOCATION) == PackageManager.PERMISSION_GRANTED
                 if (!isPermissionEnabled) {
                     showPermissionDialog = true
                 }
@@ -321,6 +340,20 @@ fun HomeScreen() {
             isCompleted = isPermissionEnabled,
             onClick = {
                 context.startActivity(Intent("android.settings.ACTION_NOTIFICATION_LISTENER_SETTINGS"))
+            }
+        )
+
+        Spacer(modifier = Modifier.height(16.dp))
+
+        SettingsItem(
+            title = "Location Access",
+            description = "Used to tag notifications with the precise location where they occurred.",
+            isCompleted = isLocationGranted,
+            onClick = {
+                locationLauncher.launch(arrayOf(
+                    Manifest.permission.ACCESS_FINE_LOCATION,
+                    Manifest.permission.ACCESS_COARSE_LOCATION
+                ))
             }
         )
 
@@ -1077,6 +1110,32 @@ private suspend fun performTestSend(
     val fullContent = "$title: $text"
     val date = SimpleDateFormat("yyyy-MM-dd HH:mm:ss", Locale.getDefault()).format(Date())
     
+    // Capture Location
+    var locationString: String? = null
+    val hasFine = ContextCompat.checkSelfPermission(context, Manifest.permission.ACCESS_FINE_LOCATION) == PackageManager.PERMISSION_GRANTED
+    val hasCoarse = ContextCompat.checkSelfPermission(context, Manifest.permission.ACCESS_COARSE_LOCATION) == PackageManager.PERMISSION_GRANTED
+    
+    if (hasFine || hasCoarse) {
+        try {
+            val fusedLocationClient = LocationServices.getFusedLocationProviderClient(context)
+            var location = Tasks.await(fusedLocationClient.lastLocation, 1, TimeUnit.SECONDS)
+            
+            if (location == null) {
+                location = Tasks.await(
+                    fusedLocationClient.getCurrentLocation(Priority.PRIORITY_BALANCED_POWER_ACCURACY, null),
+                    3, TimeUnit.SECONDS
+                )
+            }
+            
+            if (location != null) {
+                locationString = "SRID=4326;POINT(${location.longitude} ${location.latitude})"
+                AppLog.d(context, "TestSend", "Captured location: $locationString")
+            }
+        } catch (e: Exception) {
+            AppLog.e(context, "TestSend", "Location capture failed: ${e.message}")
+        }
+    }
+
     // Compilation
     val rulesJson = rulesPrefs.getString(app.packageName, "[]") ?: "[]"
     val rules = Json.decodeFromString<List<ExtractionRule>>(rulesJson)
@@ -1118,7 +1177,8 @@ private suspend fun performTestSend(
         "notification_raw" to fullContent,
         "app" to app.name,
         "source" to app.name,
-        "package" to app.packageName
+        "package" to app.packageName,
+        "location" to (locationString ?: "")
     )
     extractedData.forEach { (k, v) -> resolutionContext[k.lowercase()] = v }
 
@@ -1126,6 +1186,7 @@ private suspend fun performTestSend(
         if (mappings.isEmpty()) {
             put("app_name", app.name)
             put("raw_notification", fullContent)
+            if (locationString != null) put("location", locationString)
         } else {
             mappings.forEach { mapping ->
                 if (mapping.key.isNotBlank()) {
@@ -2047,7 +2108,7 @@ fun AppConfigItem(app: AppInfo, isChecked: Boolean, onCheckedChange: (Boolean) -
 
     // Available variables from rules + system tags
     val availableVariables = remember(rules.toList()) {
-        val list = mutableListOf("{date}", "{app}", "{package}", "{raw}")
+        val list = mutableListOf("{date}", "{app}", "{package}", "{raw}", "{location}")
         rules.forEach { if (it.varName.isNotBlank()) list.add("{${it.varName.lowercase()}}") }
         list
     }

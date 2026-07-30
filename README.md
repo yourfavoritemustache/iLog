@@ -7,6 +7,7 @@ iLog is an Android application designed to capture, process, and synchronize not
 - **Automated Notification Capture**: Monitors notifications from specific apps (e.g., Revolut, Nordea, etc.) even when the device is locked.
 - **Dynamic Data Extraction**: Define custom regular expression (Regex) rules to extract specific values (like amounts, merchants, or dates) from notification titles and text.
 - **Flexible Database Mapping**: Map extracted variables to specific columns in your Supabase tables.
+- **Precise Location Tagging**: Automatically capture and store the device's location (PostGIS compatible) at the exact moment a notification is received.
 - **Notification History**: View a local history of recently captured notifications and current active ones in the system tray.
 - **Database Synchronization**: Automatically POSTs processed data to your Supabase instance.
 - **Backup & Restore**: Securely save and retrieve your extraction rules and mappings using a unique backup key stored in Supabase.
@@ -19,6 +20,7 @@ iLog is an Android application designed to capture, process, and synchronize not
 2. Enter your **Supabase URL** and **Service Role Key**.
 3. Select your target **Table Name**.
 4. Tap **Save Configuration**.
+5. **PostGIS Setup (Optional)**: If you want to use location tracking, run `CREATE EXTENSION IF NOT EXISTS postgis;` in your Supabase SQL Editor and add a `location` column of type `geography(POINT, 4326)` to your table.
 
 ### 2. App Tracking
 1. Navigate to the **App Config** tab.
@@ -28,13 +30,14 @@ iLog is an Android application designed to capture, process, and synchronize not
    - Provide a Regex pattern (e.g., `(\d+[\.,]\d{2})`).
    - Select the source (Title or Text).
 4. Define **Body Mappings**:
-   - Map your Supabase columns to system tags (like `{date}`, `{app}`, `{raw}`) or your custom variables (like `{amount}`).
+   - Map your Supabase columns to system tags (like `{date}`, `{app}`, `{raw}`, `{location}`) or your custom variables (like `{amount}`).
 
 ### 3. Reliability Settings (Crucial)
 To ensure iLog works in the background and while the screen is locked:
 1. Go to the **Home** tab.
 2. Ensure **Notification Access** is enabled.
-3. Set Battery to **Unrestricted** (via the provided shortcut).
+3. Enable **Location Access** (required for the `{location}` tag).
+4. Set Battery to **Unrestricted** (via the provided shortcut).
 4. (Optional) Disable **Permission Hibernation**.
 
 ## 📝 How it Works
