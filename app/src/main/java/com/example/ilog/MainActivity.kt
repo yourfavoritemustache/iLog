@@ -173,7 +173,7 @@ fun MainContainer() {
         }
     }
 
-    val tabs = listOf("Home", "Database", "App Config", "Test Send", "History", "Debug Logs")
+    val tabs = listOf("Home", "Database", "App Config", "Test Send", "History", "Reprocess", "Debug Logs")
     val pagerState = rememberPagerState { tabs.size }
     val scope = rememberCoroutineScope()
 
@@ -216,7 +216,8 @@ fun MainContainer() {
                 2 -> AppConfigScreen()
                 3 -> TestSendScreen()
                 4 -> NotificationHistoryScreen()
-                5 -> DebugLogsScreen()
+                5 -> FailedNotificationsScreen()
+                6 -> DebugLogsScreen()
             }
         }
     }
@@ -1099,7 +1100,8 @@ private suspend fun performTestSend(
     text: String,
     encryptedPrefs: android.content.SharedPreferences,
     rulesPrefs: android.content.SharedPreferences,
-    mappingsPrefs: android.content.SharedPreferences
+    mappingsPrefs: android.content.SharedPreferences,
+    overrideTime: Long? = null
 ): String {
     val url = encryptedPrefs.getString("supabase_url", "") ?: ""
     val key = encryptedPrefs.getString("supabase_key", "") ?: ""
@@ -1108,7 +1110,7 @@ private suspend fun performTestSend(
     if (url.isBlank() || key.isBlank()) return "Error: Supabase not configured in 'Database' tab"
 
     val fullContent = "$title: $text"
-    val date = SimpleDateFormat("yyyy-MM-dd HH:mm:ss", Locale.getDefault()).format(Date())
+    val date = SimpleDateFormat("yyyy-MM-dd HH:mm:ss", Locale.getDefault()).format(Date(overrideTime ?: System.currentTimeMillis()))
     
     // Capture Location
     var locationString: String? = null
@@ -1193,6 +1195,11 @@ private suspend fun performTestSend(
                     var resolvedValue = mapping.valueTemplate
                     resolutionContext.forEach { (name, value) ->
                         resolvedValue = resolvedValue.replace("{$name}", value, ignoreCase = true)
+                    }
+
+                    if (mapping.key.lowercase() == "location" && resolvedValue.isBlank()) {
+                        put(mapping.key, null as String?)
+                        return@forEach
                     }
 
                     // If placeholder still exists, variable extraction failed
@@ -1602,8 +1609,32 @@ fun NotificationHistoryItem(entry: NotificationEntry, isHistory: Boolean) {
 
             Row(
                 modifier = Modifier.fillMaxWidth().padding(top = 8.dp),
-                horizontalArrangement = Arrangement.End
+                horizontalArrangement = Arrangement.End,
+                verticalAlignment = Alignment.CenterVertically
             ) {
+                var isSyncing by remember { mutableStateOf(false) }
+                val scope = rememberCoroutineScope()
+                val rulesPrefs = remember { context.getSharedPreferences("iLogRules", Context.MODE_PRIVATE) }
+                val mappingsPrefs = remember { context.getSharedPreferences("iLogMappings", Context.MODE_PRIVATE) }
+                val encryptedPrefs = remember { SecurityUtils.getEncryptedPrefs(context) }
+
+                TextButton(
+                    onClick = {
+                        isSyncing = true
+                        scope.launch(Dispatchers.IO) {
+                            performReprocess(context, entry, encryptedPrefs, rulesPrefs, mappingsPrefs)
+                            withContext(Dispatchers.Main) { isSyncing = false }
+                        }
+                    },
+                    enabled = !isSyncing
+                ) {
+                    Icon(Icons.Default.Refresh, contentDescription = null, modifier = Modifier.size(16.dp))
+                    Spacer(modifier = Modifier.width(4.dp))
+                    Text(if (isSyncing) "Syncing..." else "Sync to DB", style = MaterialTheme.typography.labelMedium)
+                }
+
+                Spacer(modifier = Modifier.width(8.dp))
+
                 TextButton(onClick = {
                     val examplesPrefs = context.getSharedPreferences("iLogExamples", Context.MODE_PRIVATE)
                     examplesPrefs.edit {
@@ -2760,4 +2791,269 @@ fun isNotificationServiceEnabled(context: Context): Boolean {
         }
     }
     return false
+}
+
+@Composable
+fun FailedNotificationsScreen() {
+    val context = LocalContext.current
+    val failedPrefs = remember { context.getSharedPreferences("iLogFailed", Context.MODE_PRIVATE) }
+    val rulesPrefs = remember { context.getSharedPreferences("iLogRules", Context.MODE_PRIVATE) }
+    val mappingsPrefs = remember { context.getSharedPreferences("iLogMappings", Context.MODE_PRIVATE) }
+    val encryptedPrefs = remember { SecurityUtils.getEncryptedPrefs(context) }
+    val scope = rememberCoroutineScope()
+
+    val failedList = remember { mutableStateListOf<NotificationEntry>() }
+    var isReprocessingAll by remember { mutableStateOf(false) }
+    var showHistoryPicker by remember { mutableStateOf(false) }
+
+    fun refreshFailed() {
+        val json = failedPrefs.getString("failed_list", "[]") ?: "[]"
+        try {
+            val list = Json.decodeFromString<List<NotificationEntry>>(json)
+            failedList.clear()
+            failedList.addAll(list)
+        } catch (_: Exception) {
+            failedList.clear()
+        }
+    }
+
+    LaunchedEffect(Unit) {
+        refreshFailed()
+    }
+
+    Column(modifier = Modifier.fillMaxSize().padding(16.dp)) {
+        Row(
+            modifier = Modifier.fillMaxWidth(),
+            horizontalArrangement = Arrangement.SpaceBetween,
+            verticalAlignment = Alignment.CenterVertically
+        ) {
+            Text("Reprocess Failed", style = MaterialTheme.typography.headlineSmall)
+            IconButton(onClick = { refreshFailed() }) {
+                Icon(Icons.Default.Refresh, contentDescription = "Refresh")
+            }
+        }
+        
+        Text(
+            "Notifications that failed to sync to Supabase. You can try to re-send them manually.",
+            style = MaterialTheme.typography.bodySmall,
+            modifier = Modifier.padding(bottom = 8.dp)
+        )
+        
+        OutlinedButton(
+            onClick = { showHistoryPicker = true },
+            modifier = Modifier.fillMaxWidth().padding(bottom = 16.dp)
+        ) {
+            Icon(Icons.Default.Add, contentDescription = null)
+            Spacer(modifier = Modifier.width(8.dp))
+            Text("Import from History")
+        }
+
+        if (failedList.isEmpty()) {
+            Box(modifier = Modifier.weight(1f).fillMaxWidth(), contentAlignment = Alignment.Center) {
+                Text("No failed notifications.")
+            }
+        } else {
+            Button(
+                onClick = {
+                    isReprocessingAll = true
+                    scope.launch(Dispatchers.IO) {
+                        val toReprocess = failedList.toList()
+                        toReprocess.forEach { entry ->
+                            val result = performReprocess(context, entry, encryptedPrefs, rulesPrefs, mappingsPrefs)
+                            if (result.startsWith("Success")) {
+                                withContext(Dispatchers.Main) {
+                                    val currentJson = failedPrefs.getString("failed_list", "[]") ?: "[]"
+                                    val current = try { Json.decodeFromString<List<NotificationEntry>>(currentJson).toMutableList() } catch(_: Exception) { mutableListOf() }
+                                    current.removeAll { it.packageName == entry.packageName && it.postTime == entry.postTime }
+                                    failedPrefs.edit().putString("failed_list", Json.encodeToString(current)).apply()
+                                    refreshFailed()
+                                }
+                            }
+                        }
+                        withContext(Dispatchers.Main) {
+                            isReprocessingAll = false
+                        }
+                    }
+                },
+                modifier = Modifier.fillMaxWidth().padding(bottom = 8.dp),
+                enabled = !isReprocessingAll
+            ) {
+                Text(if (isReprocessingAll) "Reprocessing..." else "Reprocess All (${failedList.size})")
+            }
+
+            LazyColumn(modifier = Modifier.weight(1f)) {
+                items(failedList, key = { "${it.packageName}_${it.postTime}" }) { entry ->
+                    FailedNotificationItem(entry) {
+                        refreshFailed()
+                    }
+                }
+            }
+            
+            OutlinedButton(
+                onClick = {
+                    failedPrefs.edit().putString("failed_list", "[]").apply()
+                    refreshFailed()
+                },
+                modifier = Modifier.fillMaxWidth().padding(top = 8.dp),
+                colors = ButtonDefaults.outlinedButtonColors(contentColor = MaterialTheme.colorScheme.error)
+            ) {
+                Text("Clear All")
+            }
+        }
+    }
+
+    if (showHistoryPicker) {
+        val historyPrefs = remember { context.getSharedPreferences("iLogHistory", Context.MODE_PRIVATE) }
+        val sharedPrefs = remember { context.getSharedPreferences("iLogPrefs", Context.MODE_PRIVATE) }
+        val selectedPackageNames = remember { sharedPrefs.getStringSet("selected_apps", emptySet()) ?: emptySet() }
+        
+        val allHistory = remember {
+            val list = mutableListOf<NotificationEntry>()
+            val processedPackages = mutableSetOf<String>()
+            selectedPackageNames.forEach { key ->
+                val pkg = key.split("_")[0]
+                if (pkg !in processedPackages) {
+                    val json = historyPrefs.getString(pkg, "[]") ?: "[]"
+                    try {
+                        list.addAll(Json.decodeFromString<List<NotificationEntry>>(json))
+                    } catch (_: Exception) {}
+                    processedPackages.add(pkg)
+                }
+            }
+            list.sortedByDescending { it.postTime }
+        }
+
+        AlertDialog(
+            onDismissRequest = { showHistoryPicker = false },
+            title = { Text("Import from History") },
+            text = {
+                if (allHistory.isEmpty()) {
+                    Text("No history found.")
+                } else {
+                    LazyColumn(modifier = Modifier.height(400.dp)) {
+                        items(allHistory) { entry ->
+                            Row(
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .clickable {
+                                        val currentJson = failedPrefs.getString("failed_list", "[]") ?: "[]"
+                                        val current = try { Json.decodeFromString<List<NotificationEntry>>(currentJson).toMutableList() } catch(_: Exception) { mutableListOf() }
+                                        if (!current.any { it.packageName == entry.packageName && it.postTime == entry.postTime }) {
+                                            current.add(0, entry)
+                                            failedPrefs.edit().putString("failed_list", Json.encodeToString(current)).apply()
+                                            refreshFailed()
+                                        }
+                                        showHistoryPicker = false
+                                    }
+                                    .padding(vertical = 8.dp),
+                                verticalAlignment = Alignment.CenterVertically
+                            ) {
+                                Column {
+                                    Text(entry.title, style = MaterialTheme.typography.bodyMedium)
+                                    Text("${entry.packageName} • ${SimpleDateFormat("MMM dd, HH:mm", Locale.getDefault()).format(Date(entry.postTime))}", 
+                                        style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.outline)
+                                }
+                            }
+                            HorizontalDivider()
+                        }
+                    }
+                }
+            },
+            confirmButton = {
+                TextButton(onClick = { showHistoryPicker = false }) { Text("Close") }
+            }
+        )
+    }
+}
+
+@Composable
+fun FailedNotificationItem(entry: NotificationEntry, onSuccess: () -> Unit) {
+    val context = LocalContext.current
+    val rulesPrefs = remember { context.getSharedPreferences("iLogRules", Context.MODE_PRIVATE) }
+    val mappingsPrefs = remember { context.getSharedPreferences("iLogMappings", Context.MODE_PRIVATE) }
+    val failedPrefs = remember { context.getSharedPreferences("iLogFailed", Context.MODE_PRIVATE) }
+    val encryptedPrefs = remember { SecurityUtils.getEncryptedPrefs(context) }
+    val scope = rememberCoroutineScope()
+    
+    val sdf = remember { SimpleDateFormat("MMM dd, HH:mm:ss", Locale.getDefault()) }
+    var isReprocessing by remember { mutableStateOf(false) }
+    var statusMessage by remember { mutableStateOf("") }
+
+    Card(
+        modifier = Modifier.fillMaxWidth().padding(vertical = 4.dp),
+        elevation = CardDefaults.cardElevation(defaultElevation = 1.dp)
+    ) {
+        Column(modifier = Modifier.padding(12.dp)) {
+            Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
+                Column(modifier = Modifier.weight(1f)) {
+                    Text(text = entry.title, style = MaterialTheme.typography.titleSmall)
+                    Text(text = entry.packageName, style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.outline)
+                }
+                Text(text = sdf.format(Date(entry.postTime)), style = MaterialTheme.typography.labelSmall)
+            }
+            Spacer(modifier = Modifier.height(4.dp))
+            Text(text = entry.text, style = MaterialTheme.typography.bodySmall)
+            
+            if (statusMessage.isNotEmpty()) {
+                Text(text = statusMessage, style = MaterialTheme.typography.labelSmall, color = if (statusMessage.startsWith("Error")) MaterialTheme.colorScheme.error else MaterialTheme.colorScheme.primary)
+            }
+
+            Row(modifier = Modifier.fillMaxWidth().padding(top = 8.dp), horizontalArrangement = Arrangement.End) {
+                TextButton(onClick = {
+                    val currentJson = failedPrefs.getString("failed_list", "[]") ?: "[]"
+                    val current = try { Json.decodeFromString<List<NotificationEntry>>(currentJson).toMutableList() } catch(_: Exception) { mutableListOf() }
+                    current.removeAll { it.packageName == entry.packageName && it.postTime == entry.postTime }
+                    failedPrefs.edit().putString("failed_list", Json.encodeToString(current)).apply()
+                    onSuccess()
+                }) {
+                    Text("Dismiss", color = MaterialTheme.colorScheme.error)
+                }
+                
+                Button(
+                    onClick = {
+                        isReprocessing = true
+                        statusMessage = "Syncing..."
+                        scope.launch(Dispatchers.IO) {
+                            val result = performReprocess(context, entry, encryptedPrefs, rulesPrefs, mappingsPrefs)
+                            withContext(Dispatchers.Main) {
+                                isReprocessing = false
+                                if (result.startsWith("Success")) {
+                                    val currentJson = failedPrefs.getString("failed_list", "[]") ?: "[]"
+                                    val current = try { Json.decodeFromString<List<NotificationEntry>>(currentJson).toMutableList() } catch(_: Exception) { mutableListOf() }
+                                    current.removeAll { it.packageName == entry.packageName && it.postTime == entry.postTime }
+                                    failedPrefs.edit().putString("failed_list", Json.encodeToString(current)).apply()
+                                    onSuccess()
+                                } else {
+                                    statusMessage = result
+                                }
+                            }
+                        }
+                    },
+                    enabled = !isReprocessing
+                ) {
+                    Text(if (isReprocessing) "..." else "Reprocess")
+                }
+            }
+        }
+    }
+}
+
+private suspend fun performReprocess(
+    context: Context,
+    entry: NotificationEntry,
+    encryptedPrefs: android.content.SharedPreferences,
+    rulesPrefs: android.content.SharedPreferences,
+    mappingsPrefs: android.content.SharedPreferences
+): String {
+    val appInfo = AppInfo(
+        name = try {
+            val pm = context.packageManager
+            pm.getApplicationLabel(pm.getApplicationInfo(entry.packageName, 0)).toString()
+        } catch (_: Exception) { entry.packageName },
+        packageName = entry.packageName,
+        isPrivateSpace = entry.isPrivateSpace,
+        userIdentifier = entry.userIdentifier
+    )
+    
+    return performTestSend(context, appInfo, entry.title, entry.text, encryptedPrefs, rulesPrefs, mappingsPrefs, entry.postTime)
 }

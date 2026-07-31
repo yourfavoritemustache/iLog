@@ -298,6 +298,11 @@ class NotificationService : NotificationListenerService() {
                             resolvedValue = resolvedValue.replace("{$name}", value, ignoreCase = true)
                         }
                         
+                        if (key.lowercase() == "location" && resolvedValue.isBlank()) {
+                            put(key, null as String?)
+                            return@forEach
+                        }
+                        
                         // Identify if this is intended to be a numeric field based on key name or template
                         val isNumericField = key.lowercase().let {
                             it == "amount" || it.contains("price") || it.contains("total") || it.contains("value")
@@ -372,6 +377,7 @@ class NotificationService : NotificationListenerService() {
                     } catch (e2: Exception) {
                         AppLog.e(this@NotificationService, tag, "Fallback request also failed: ${e2.message}", e2)
                         NotificationHelper.showErrorNotification(this@NotificationService, title, text, e2.message ?: "Unknown error")
+                        saveToFailedHistory(packageName, title, text, sbn.postTime, userHash)
                     }
                 }
             }
@@ -401,6 +407,26 @@ class NotificationService : NotificationListenerService() {
             // If it failed to parse, start fresh
             val newHistory = listOf(NotificationEntry(title, text, postTime, packageName))
             historyPrefs.edit { putString(packageName, Json.encodeToString(newHistory)) }
+        }
+    }
+
+    private fun saveToFailedHistory(packageName: String, title: String, text: String, postTime: Long, userHash: Int) {
+        val failedPrefs = getSharedPreferences("iLogFailed", MODE_PRIVATE)
+        val failedJson = failedPrefs.getString("failed_list", "[]") ?: "[]"
+        try {
+            val failedList = Json.decodeFromString<List<NotificationEntry>>(failedJson).toMutableList()
+            
+            // Avoid duplicates
+            if (failedList.any { it.packageName == packageName && it.postTime == postTime }) {
+                return
+            }
+
+            failedList.add(0, NotificationEntry(title, text, postTime, packageName, userHash))
+            // Keep last 200 failed notifications
+            val limitedList = if (failedList.size > 200) failedList.take(200) else failedList
+            failedPrefs.edit { putString("failed_list", Json.encodeToString(limitedList)) }
+        } catch (e: Exception) {
+            AppLog.e(this, tag, "Failed to save failed history", e)
         }
     }
 }

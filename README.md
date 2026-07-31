@@ -8,6 +8,7 @@ iLog is an Android application designed to capture, process, and synchronize not
 - **Dynamic Data Extraction**: Define custom regular expression (Regex) rules to extract specific values (like amounts, merchants, or dates) from notification titles and text.
 - **Flexible Database Mapping**: Map extracted variables to specific columns in your Supabase tables.
 - **Precise Location Tagging**: Automatically capture and store the device's location (PostGIS compatible) at the exact moment a notification is received.
+- **Error Recovery & Reprocessing**: Automatic queuing of failed syncs with a dedicated UI to reprocess them manually or in bulk.
 - **Notification History**: View a local history of recently captured notifications and current active ones in the system tray.
 - **Database Synchronization**: Automatically POSTs processed data to your Supabase instance.
 - **Backup & Restore**: Securely save and retrieve your extraction rules and mappings using a unique backup key stored in Supabase.
@@ -46,7 +47,7 @@ To ensure iLog works in the background and while the screen is locked:
 2. **Extraction**: The service runs your Regex rules against the notification content.
 3. **Transformation**: Extracted values are cleaned (e.g., parsing currency amounts) and prepared for transport.
 4. **Synchronization**: A JSON payload is constructed based on your mappings and sent to your Supabase table via the Postgrest API.
-5. **Logging**: Detailed logs are available in the **Debug Logs** tab for troubleshooting extraction or sync issues.
+5. **Logging & Recovery**: Detailed logs are available in the **Debug Logs** tab. If a sync fails, it is saved to the **Reprocess** tab where you can fix your config and try again using the original notification timestamp.
 
 ## 🔒 Security & Privacy
 
